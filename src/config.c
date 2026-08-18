@@ -21,7 +21,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #ifdef MINITOR_CHUTNEY
   int tor_authorities_count = 3;
 #else
-  int tor_authorities_count = 5;
+  int tor_authorities_count = 6;
 #endif
 
 const char* tor_authorities[] =
@@ -31,17 +31,12 @@ MINITOR_CHUTNEY_ADDRESS_STR " dirport=7000",
 MINITOR_CHUTNEY_ADDRESS_STR " dirport=7001",
 MINITOR_CHUTNEY_ADDRESS_STR " dirport=7002"
 #else
-/* type=fallback */
-/* version=4.0.0 */
-/* timestamp=20210412000000 */
-/* source=offer-list */
-//
-// Generated on: Fri, 04 Feb 2022 15:49:02 +0000
-
-"194.5.96.42 dirport=80",
-"199.249.230.174 dirport=80",
-"81.169.180.28 dirport=9030",
-"194.50.94.247 dirport=9030",
-"135.23.97.216 dirport=9030",
+/* Updated 2026-08-15 — verified from live Tor consensus */
+"199.58.81.140 dirport=80",   /* longclaw  — official DA */
+"204.13.164.118 dirport=80",  /* bastet    — official DA */
+"131.188.40.189 dirport=80",  /* gabelmoo  — official DA */
+"171.25.193.9 dirport=443",   /* maatuska  — official DA, HTTP on 443 */
+"195.154.164.243 dirport=80", /* fallback  — verified 2026-08-15 */
+"217.196.147.77 dirport=80",  /* fallback  — verified 2026-08-15 */
 #endif
 };

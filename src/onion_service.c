@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "wolfssl/options.h"
 #include "wolfssl/wolfcrypt/hash.h"
 #include "wolfssl/wolfcrypt/fe_operations.h"
+#include "wolfssl/wolfcrypt/ge_operations.h"
 #include "../h/custom_sc.h"
 
 #include "../h/onion_service.h"
@@ -1157,6 +1158,17 @@ int d_generate_outer_descriptor( char* filename, ed25519_key* descriptor_signing
     goto finish;
   }
 
+  // newline required between base64 cert and -----END marker
+  succ = write( plain_fd, "\n", 1 );
+
+  if ( succ != 1 )
+  {
+    MINITOR_LOG( MINITOR_TAG, "Failed to write newline %s", plain_file );
+
+    ret = -1;
+    goto finish;
+  }
+
   succ = write( plain_fd, outer_layer_template_1, strlen( outer_layer_template_1 ) );
 
   if ( succ != strlen( outer_layer_template_1 ) )
@@ -1241,6 +1253,12 @@ int d_generate_outer_descriptor( char* filename, ed25519_key* descriptor_signing
     goto finish;
   }
 
+  // Sign the descriptor content BEFORE the "signature" line is written.
+  // Tor/stem sign  PREFIX + (all fields up to and including the final newline
+  // of the superencrypted block); the "signature " keyword is NOT part of the
+  // signed data (verified against stem and Tor's desc_sig_is_valid). Since
+  // ed25519_sign_msg_custom hashes the whole file from byte 0, it must run
+  // while the file still ends at "-----END MESSAGE-----\n".
   idx = ED25519_SIG_SIZE;
   wolf_succ = ed25519_sign_msg_custom( plain_fd, tmp_signature, &idx, descriptor_signing_key );
 
@@ -1252,8 +1270,7 @@ int d_generate_outer_descriptor( char* filename, ed25519_key* descriptor_signing
     goto finish;
   }
 
-  v_base_64_encode( tmp_buff, tmp_signature, 64 );
-
+  // Now append the signature line: "signature" SP base64(sig) NL
   succ = write( plain_fd, outer_layer_template_4, strlen( outer_layer_template_4 ) );
 
   if ( succ != strlen( outer_layer_template_4 ) )
@@ -1264,6 +1281,8 @@ int d_generate_outer_descriptor( char* filename, ed25519_key* descriptor_signing
     goto finish;
   }
 
+  v_base_64_encode( tmp_buff, tmp_signature, 64 );
+
   succ = write( plain_fd, tmp_buff, 86 );
 
   if ( succ != 86 )
@@ -1271,7 +1290,11 @@ int d_generate_outer_descriptor( char* filename, ed25519_key* descriptor_signing
     MINITOR_LOG( MINITOR_TAG, "Failed to write %s", plain_file );
 
     ret = -1;
+    goto finish;
   }
+
+  // trailing newline required by spec: "signature" SP sig NL
+  write( plain_fd, "\n", 1 );
 
 finish:
   close( plain_fd );
@@ -2031,7 +2054,7 @@ int d_generate_packed_crosscert( char* destination, unsigned char* certified_key
   }
 
   idx = ED25519_SIG_SIZE;
-  wolf_succ = wc_ed25519_sign_msg( tmp_body, 76, tmp_body + 76, &idx, signing_key );
+  wolf_succ = ed25519_sign_buf_custom( tmp_body, 76, tmp_body + 76, &idx, signing_key );
 
   if ( wolf_succ < 0 || idx != ED25519_SIG_SIZE ) {
     MINITOR_LOG( MINITOR_TAG, "Failed to sign the ed crosscert, error code: %d", wolf_succ );
@@ -2237,7 +2260,13 @@ int d_derive_blinded_key( ed25519_key* blinded_key, ed25519_key* master_key, int
     return -1;
   }
 
-  wc_Sha3_256_Update( &reusable_sha3, (unsigned char*)"Derive temporary signing key", strlen( "Derive temporary signing key" ) + 1 );
+  wc_Sha3_256_Update( &reusable_sha3, (unsigned char*)"Derive temporary signing key", strlen( "Derive temporary signing key" ) );
+  // rend-spec-v3 [KEYBLIND]: BLIND_STRING = "Derive temporary signing key" | INT_1(0)
+  // The trailing zero byte is MANDATORY. Without it the blinding factor h (and
+  // thus the blinded key) differs from what Tor clients compute, so they look
+  // for the descriptor under the wrong blinded key and get "host unreachable".
+  // Verified against stem: expected blinded pubkey only matches WITH this byte.
+  wc_Sha3_256_Update( &reusable_sha3, (unsigned char*)"\x00", 1 );
   wc_Sha3_256_Update( &reusable_sha3, tmp_pub_key, ED25519_PUB_KEY_SIZE );
 
   if ( secret != NULL )
@@ -2271,15 +2300,25 @@ int d_derive_blinded_key( ed25519_key* blinded_key, ed25519_key* master_key, int
   wc_Sha3_256_Update( &reusable_sha3, tmp_64_array, sizeof( tmp_64_array ) );
   wc_Sha3_256_Final( &reusable_sha3, reusable_sha3_sum );
 
+  // Clamp the master expanded scalar a (tmp_priv_key = SHA512(seed) is the raw
+  // expansion and must be clamped, like ed25519_ref10_seckey_expand).
+  tmp_priv_key[0] &= 248;
+  tmp_priv_key[31] &= 63;
+  tmp_priv_key[31] |= 64;
+
+  // Clamp the blinding factor h too. Tor clamps h in BOTH
+  // ed25519_ref10_blind_secret_key and ed25519_ref10_blind_public_key, so the
+  // blinded pubkey the network derives from the identity key is clamp(h)*A.
+  // If we blind the private scalar with an unclamped h, our blinded pubkey
+  // (h*A) won't match the expected clamp(h)*A and HSDirs reject the descriptor
+  // with "400 Invalid HS descriptor. Rejected."
   reusable_sha3_sum[0] &= 248;
   reusable_sha3_sum[31] &= 63;
   reusable_sha3_sum[31] |= 64;
 
   memcpy( reduced_priv_key, tmp_priv_key, 32 );
 
-  //sc_reduce( reduced_priv_key );
-  //sc_reduce( reusable_sha3_sum );
-  //sc_muladd( out_priv_key, reduced_priv_key, reusable_sha3_sum, zero );
+  // out_priv_key = a * clamp(h) mod L   (a' = blinded private scalar)
   minitor_sc_muladd( out_priv_key, tmp_priv_key, reusable_sha3_sum, zero );
 
   wc_Sha512Update( &reusable_sha512, (unsigned char*)"Derive temporary signing key hash input", strlen( "Derive temporary signing key hash input" ) );
@@ -2289,9 +2328,14 @@ int d_derive_blinded_key( ed25519_key* blinded_key, ed25519_key* master_key, int
   memcpy( out_priv_key + 32, reusable_sha512_sum, WC_SHA3_256_DIGEST_SIZE );
 
   memcpy( blinded_key->k, out_priv_key, ED25519_PRV_KEY_SIZE );
+  blinded_key->no_clamp = 1;
 
-  wc_ed25519_make_public( blinded_key, blinded_key->p, ED25519_PUB_KEY_SIZE );
-
+  // Compute blinded pubkey directly — wc_ed25519_make_public re-clamps and gives wrong result
+  {
+    ge_p3 pub_point;
+    ge_scalarmult_base( &pub_point, out_priv_key );
+    ge_p3_tobytes( blinded_key->p, &pub_point );
+  }
   blinded_key->pubKeySet = 1;
 
   wc_Sha3_256_Free( &reusable_sha3 );
@@ -2851,6 +2895,7 @@ int d_push_hsdir( OnionService* service )
   fresh_until = network_consensus.fresh_until;
 
   time_period = d_get_hs_time_period( network_consensus.fresh_until, network_consensus.valid_after, network_consensus.hsdir_interval );
+  MINITOR_LOG( MINITOR_TAG, "hsdir push time_period=%d valid_after=%ld fresh_until=%ld interval=%d", time_period, (long)valid_after, (long)fresh_until, network_consensus.hsdir_interval );
 
   // my stragety is to get all the target relays within a single mutex lock so that we
   // can garentee that we use the same consensus in case it tries to update during the
@@ -2894,6 +2939,7 @@ int d_push_hsdir( OnionService* service )
 
   service->hsdir_to_send = service->target_relays[0]->length + service->target_relays[1]->length;
   service->hsdir_sent = 0;
+  MINITOR_LOG( MINITOR_TAG, "hsdir_to_send=%d (period0=%d period1=%d)", service->hsdir_to_send, service->target_relays[0]->length, service->target_relays[1]->length );
 
   revision_counter = d_roll_revision_counter( service->master_key.p );
 

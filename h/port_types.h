@@ -15,6 +15,11 @@ typedef struct port_timer_t
   bool repeat;
   void* data;
   void ( *function )( struct port_timer_t* );
+  volatile bool quit;
+  volatile int  generation;    /* incremented on restart; old thread exits autonomously */
+  volatile bool thread_done;   /* set by exiting thread; port_timer_stop() waits on it */
+  pthread_mutex_t quit_mutex;
+  pthread_cond_t  quit_cond;
 } port_timer_t;
 
 typedef port_timer_t* MinitorTimer;
@@ -29,6 +34,8 @@ typedef struct port_queue_t
 	pthread_mutex_t mutex;
 	pthread_cond_t cond_full;
 	pthread_cond_t cond_empty;
+  volatile bool closing;      /* set by port_queue_delete; dequeue returns false */
+  volatile int  waiter_count; /* threads blocked in dequeue; delete waits for 0 */
 } port_queue_t;
 
 typedef port_queue_t* MinitorQueue;

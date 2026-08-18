@@ -492,6 +492,8 @@ int d_router_extend2( OnionCircuit* circuit, DlConnection* or_connection, int no
   }
 
   // send the EXTEND2 cell
+  MINITOR_LOG( MINITOR_TAG, "sending EXTEND2 circ=%x hop=%d", circuit->circ_id, node_index );
+
   if ( d_send_relay_cell_and_free( or_connection, extend2_cell, &circuit->relay_list, NULL ) < 0 )
   {
     MINITOR_LOG( MINITOR_TAG, "Failed to send RELAY_EXTEND2 cell" );
@@ -796,6 +798,7 @@ int d_ntor_handshake_finish( uint8_t* handshake_data, DoublyLinkedOnionRelay* db
   bytes_remaining = HASH_LEN - bytes_written;
 
   // generate the second 32 bytes
+  wc_HmacSetKey( &reusable_hmac, WC_SHA256, key_seed, WC_SHA256_DIGEST_SIZE );
   wc_HmacUpdate( &reusable_hmac, reusable_hmac_digest, WC_SHA256_DIGEST_SIZE );
   wc_HmacUpdate( &reusable_hmac, (unsigned char*)PROTOID_EXPAND, PROTOID_EXPAND_LENGTH );
   expand_i = 2;
@@ -815,6 +818,7 @@ int d_ntor_handshake_finish( uint8_t* handshake_data, DoublyLinkedOnionRelay* db
   bytes_remaining = KEY_LEN - bytes_written;
 
   // generate the third 32 bytes
+  wc_HmacSetKey( &reusable_hmac, WC_SHA256, key_seed, WC_SHA256_DIGEST_SIZE );
   wc_HmacUpdate( &reusable_hmac, reusable_hmac_digest, WC_SHA256_DIGEST_SIZE );
   wc_HmacUpdate( &reusable_hmac, (unsigned char*)PROTOID_EXPAND, PROTOID_EXPAND_LENGTH );
   expand_i = 3;
@@ -955,9 +959,11 @@ fail:
   free( initiator_rsa_identity_cert_der );
   free( initiator_rsa_auth_cert_der );
 
-  // I need to free this in the fail states of the other steps of the handshake
+  /* NULL after free so v_cleanup_connection_in_lock doesn't double-free */
   free( or_connection->responder_rsa_identity_key_der );
+  or_connection->responder_rsa_identity_key_der = NULL;
   free( or_connection->initiator_rsa_identity_key_der );
+  or_connection->initiator_rsa_identity_key_der = NULL;
 
   wc_Sha256Free( &or_connection->responder_sha );
   wc_Sha256Free( &or_connection->initiator_sha );
@@ -1005,11 +1011,13 @@ int d_process_certs( DlConnection* or_connection, CellVariable* certs_cell, int 
   return 0;
 
 fail:
-  // I need to free this in the fail states of the other steps of the handshake
   wc_FreeRsaKey( &or_connection->initiator_rsa_auth_key );
 
+  /* NULL after free so v_cleanup_connection_in_lock doesn't double-free */
   free( or_connection->responder_rsa_identity_key_der );
+  or_connection->responder_rsa_identity_key_der = NULL;
   free( or_connection->initiator_rsa_identity_key_der );
+  or_connection->initiator_rsa_identity_key_der = NULL;
 
   wc_Sha256Free( &or_connection->responder_sha );
   wc_Sha256Free( &or_connection->initiator_sha );
@@ -1082,24 +1090,19 @@ int d_process_challenge( DlConnection* or_connection, CellVariable* challenge_ce
   // create a sha hash of the tls cert and copy it in
   tmp_cert_buf = wolfSSL_X509_get_der( peer_cert, &tmp_cert_len );
 
-  MINITOR_LOG( MINITOR_TAG, "der memcmp %d %d %d", memcmp( tmp_cert_buf, peer_cert->derCert->buffer, tmp_cert_len ), tmp_cert_len, peer_cert->derCert->length );
-
   wc_Sha256Update( &reusable_sha, tmp_cert_buf, tmp_cert_len );
   wc_Sha256Final( &reusable_sha, reusable_sha_sum );
   memcpy( authenticate_cell->payload.authenticate.auth_1.server_cert, reusable_sha_sum, 32 );
 
-  MINITOR_LOG( MINITOR_TAG, "master memcmp %d %d %d", memcmp( or_connection->master_secret, or_connection->ssl->arrays->masterSecret, SECRET_LEN ), SECRET_LEN, sizeof( or_connection->master_secret ) );
-
-  // set the hmac key to the master secret that was negotiated
-  //wc_HmacSetKey( &tls_secrets_hmac, WC_SHA256, or_connection->master_secret, sizeof( or_connection->master_secret ) );
-  wc_HmacSetKey( &tls_secrets_hmac, WC_SHA256, or_connection->ssl->arrays->masterSecret, sizeof( or_connection->master_secret ) );
+  /* master_secret was saved into or_connection->master_secret by conn_secrects_cb()
+     during wolfSSL_connect().  With WOLFSSL_SMALL_STACK, wolfSSL may free
+     ssl->arrays after the handshake, making ssl->arrays->masterSecret NULL.
+     Use the already-cached copy to avoid the LoadProhibited crash. */
+  wc_HmacSetKey( &tls_secrets_hmac, WC_SHA256, or_connection->master_secret, sizeof( or_connection->master_secret ) );
 
   // update the hmac
   wolfSSL_get_client_random( or_connection->ssl, client_random, sizeof( client_random ) );
   wolfSSL_get_server_random( or_connection->ssl, server_random, sizeof( server_random ) );
-
-  MINITOR_LOG( MINITOR_TAG, "client_random memcmp %d", memcmp( client_random, or_connection->ssl->arrays->clientRandom, 32 ) );
-  MINITOR_LOG( MINITOR_TAG, "server_random memcmp %d", memcmp( server_random, or_connection->ssl->arrays->serverRandom, 32 ) );
 
   wc_HmacUpdate( &tls_secrets_hmac, client_random, sizeof( client_random ) );
   wc_HmacUpdate( &tls_secrets_hmac, server_random, sizeof( server_random ) );
@@ -1141,9 +1144,11 @@ finish:
 
   wc_Sha256Free( &reusable_sha );
 
-  // I need to free this in the fail states of the other steps of the handshake
+  /* NULL after free so v_cleanup_connection_in_lock doesn't double-free */
   free( or_connection->responder_rsa_identity_key_der );
+  or_connection->responder_rsa_identity_key_der = NULL;
   free( or_connection->initiator_rsa_identity_key_der );
+  or_connection->initiator_rsa_identity_key_der = NULL;
 
   wc_FreeRsaKey( &or_connection->initiator_rsa_auth_key );
 
@@ -1160,46 +1165,34 @@ int d_process_netinfo( DlConnection* or_connection, Cell* netinfo_cell )
   int i;
   int wolf_succ;
   Cell* res_netinfo_cell;
-  uint8_t my_address[16];
+  uint8_t my_address[4];
   int my_address_length;
-  uint8_t other_address[16];
-  int other_address_length = 0;
   MyAddr* working_myaddr;
 
   v_hostize_cell( netinfo_cell );
 
+  /* Extract OUR address as seen by the relay (should be IPv4). */
   my_address_length = netinfo_cell->payload.netinfo.addresses_4.otheraddr.length;
 
   if ( my_address_length == 4 )
   {
-    memcpy( my_address, netinfo_cell->payload.netinfo.addresses_4.otheraddr.address, my_address_length );
-
-    working_myaddr = netinfo_cell->payload.netinfo.addresses_4.myaddr.addresses;
-
-    for ( i = 0; i < netinfo_cell->payload.netinfo.addresses_4.myaddr.num_myaddr; i++ )
-    {
-      other_address_length = working_myaddr->length;
-
-      if ( other_address_length == 4 )
-      {
-        memcpy( other_address, working_myaddr->address, other_address_length );
-        break;
-      }
-      else
-      {
-        // TODO ipv6 support
-        other_address_length = -1;
-      }
-
-      working_myaddr = (uint8_t*)working_myaddr + 2 + working_myaddr->length;
-    }
+    memcpy( my_address, netinfo_cell->payload.netinfo.addresses_4.otheraddr.address, 4 );
   }
-
-  // TODO ipv6 support
-  if ( my_address_length != 4 || other_address_length == -1 )
+  else
   {
-    return -1;
+    /* Relay sees us as IPv6 or unknown — use 0.0.0.0 as fallback. */
+    my_address_length = 4;
+    memset( my_address, 0, 4 );
   }
+
+  /* For our NETINFO response, otheraddr = the relay's address as we know it
+     (the IPv4 we connected to).  We KNOW this address; no need to parse MYADDRS,
+     which may be IPv6-only on modern relays and cause a spurious return -1. */
+  uint8_t relay_address[4];
+  relay_address[0] = (uint8_t)( or_connection->address );
+  relay_address[1] = (uint8_t)( or_connection->address >> 8 );
+  relay_address[2] = (uint8_t)( or_connection->address >> 16 );
+  relay_address[3] = (uint8_t)( or_connection->address >> 24 );
 
   res_netinfo_cell = malloc( MINITOR_CELL_LEN );
 
@@ -1212,8 +1205,8 @@ int d_process_netinfo( DlConnection* or_connection, Cell* netinfo_cell )
   time( &( res_netinfo_cell->payload.netinfo.time ) );
 
   res_netinfo_cell->payload.netinfo.addresses_4.otheraddr.type = IPv4;
-  res_netinfo_cell->payload.netinfo.addresses_4.otheraddr.length = other_address_length;
-  memcpy( res_netinfo_cell->payload.netinfo.addresses_4.otheraddr.address, other_address, other_address_length );
+  res_netinfo_cell->payload.netinfo.addresses_4.otheraddr.length = 4;
+  memcpy( res_netinfo_cell->payload.netinfo.addresses_4.otheraddr.address, relay_address, 4 );
 
   res_netinfo_cell->payload.netinfo.addresses_4.myaddr.num_myaddr = 1;
 

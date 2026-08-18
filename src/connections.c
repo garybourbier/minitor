@@ -66,8 +66,6 @@ static int conn_secrects_cb( WOLFSSL* ssl, void* secret, int* secretSz, void* ct
 {
   DlConnection* or_connection = ctx;
 
-  MINITOR_LOG( CONN_TAG, "SETTING master_secret memcmp: %d %d", memcmp( secret, ssl->arrays->masterSecret, 48 ), *secretSz );
-
   memcpy( or_connection->master_secret, secret, 48 );
 
   return 0;
@@ -107,8 +105,15 @@ static void v_cleanup_connection_in_lock( DlConnection* dl_connection )
     {
       wc_FreeRsaKey( &dl_connection->initiator_rsa_auth_key );
 
-      free( dl_connection->responder_rsa_identity_key_der );
-      free( dl_connection->initiator_rsa_identity_key_der );
+      /* circuit.c fail paths already free and NULL these; guard against double-free */
+      if ( dl_connection->responder_rsa_identity_key_der != NULL )
+      {
+        free( dl_connection->responder_rsa_identity_key_der );
+      }
+      if ( dl_connection->initiator_rsa_identity_key_der != NULL )
+      {
+        free( dl_connection->initiator_rsa_identity_key_der );
+      }
 
       wc_Sha256Free( &dl_connection->responder_sha );
       wc_Sha256Free( &dl_connection->initiator_sha );
@@ -182,7 +187,15 @@ static OnionMessage* px_recv_on_or_connection( DlConnection* or_connection )
 
   if ( succ <= 0 )
   {
+    MINITOR_LOG( CONN_TAG, "recv fail conn_id=%d succ=%d ssl_err=%d status=%d", or_connection->conn_id, succ, wolfSSL_get_error( or_connection->ssl, succ ), or_connection->status );
     return NULL;
+  }
+
+  {
+    // After d_recv_cell shifts by FIXED_CELL_OFFSET=2: circ_id at bytes 2-5, cmd at byte 6
+    uint32_t dbg_circ = ( (uint32_t)(uint8_t)cell[2] << 24 ) | ( (uint32_t)(uint8_t)cell[3] << 16 ) | ( (uint32_t)(uint8_t)cell[4] << 8 ) | (uint8_t)cell[5];
+    uint8_t  dbg_cmd  = cell[6];
+    MINITOR_LOG( CONN_TAG, "rx cell circ_id=%x cmd=%d", dbg_circ, dbg_cmd );
   }
 
   or_connection->cell_ring_buf[or_connection->cell_ring_end] = cell;
@@ -266,19 +279,29 @@ void v_poll_daemon( void* pv_parameters )
 
   while ( 1 )
   {
-    count = poll( connections_poll, 16, -1 );
+    /* 500ms timeout so we check for a cooperative quit signal regularly.
+       pthread_cancel() is not supported on ESP32; the connections daemon
+       sends false via poll_task_queue and calls pthread_join() instead. */
+    count = poll( connections_poll, 16, 500 );
+
+    /* Non-blocking check for quit signal between poll() calls */
+    if ( MINITOR_DEQUEUE_NONBLOCKING( poll_task_queue, &ready ) )
+    {
+      if ( ready == false )
+      {
+        MINITOR_TASK_DELETE( NULL );
+      }
+    }
 
     if ( count > 0 )
     {
       MINITOR_ENQUEUE_BLOCKING( connections_task_queue, (void*)(&ready) );
-    }
 
-    MINITOR_DEQUEUE_BLOCKING( poll_task_queue, &ready );
-
-    // if false was on queue we need to delete ourself
-    if ( ready == false )
-    {
-      MINITOR_TASK_DELETE( NULL );
+      /* Wait for ACK from connections daemon; false ACK means quit */
+      if ( !MINITOR_DEQUEUE_BLOCKING( poll_task_queue, &ready ) || ready == false )
+      {
+        MINITOR_TASK_DELETE( NULL );
+      }
     }
   }
 }
@@ -297,6 +320,7 @@ void v_connections_daemon( void* pv_parameters )
   DlConnection* dl_connection = NULL;
   DlConnection* tmp_connection;
   int ready_connids[16];
+  bool needs_hup[16];  // true = drain then cleanup (POLLHUP)
   DlConnection* ready_connection;
   MinitorTask poll_daemon_task_handle = NULL;
 
@@ -314,8 +338,15 @@ void v_connections_daemon( void* pv_parameters )
     if ( ready == false )
     {
       // delete the poll task
-      MINITOR_TASK_DELETE( poll_daemon_task_handle );
-      // delete the poll queue in case the poll task was blocked on it
+      /* Cooperative shutdown: send false as ACK/quit signal so the poll
+         daemon exits via MINITOR_TASK_DELETE(NULL) → pthread_exit(NULL).
+         Then join the thread (max ~500ms due to poll() timeout) before
+         freeing the queue.  pthread_cancel() is a no-op on ESP32. */
+      {
+        bool quit = false;
+        MINITOR_ENQUEUE_BLOCKING( poll_task_queue, (void*)(&quit) );
+        pthread_join( poll_daemon_task_handle, NULL );
+      }
       MINITOR_QUEUE_DELETE( poll_task_queue );
 
       // create the poll queue and task
@@ -341,23 +372,23 @@ void v_connections_daemon( void* pv_parameters )
     {
       if ( dl_connection->is_or == 1 )
       {
-        if ( ( connections_poll[dl_connection->poll_index].revents & POLLERR ) != 0 || ( connections_poll[dl_connection->poll_index].revents & POLLHUP ) != 0 )
-        {
-          // MUTEX TAKE
-          MINITOR_MUTEX_TAKE_BLOCKING( connection_access_mutex[dl_connection->mutex_index] );
+        int revents = connections_poll[dl_connection->poll_index].revents;
+        int ssl_pend = wolfSSL_pending( dl_connection->ssl );
+        // On ESP32/LwIP: POLLIN=1, POLLERR=32, POLLHUP=64.
+        // When relay sends data+FIN simultaneously LwIP gives POLLIN|POLLERR (33).
+        // Always drain POLLIN / wolfSSL data before treating POLLERR/POLLHUP as
+        // a close event; needs_hup marks that cleanup is required after the drain.
+        int err_bits = ( revents & POLLERR ) | ( revents & POLLHUP );
+        int has_data = ( revents & POLLIN ) || ssl_pend > 0;
 
-          v_cleanup_connection_in_lock( dl_connection );
-
-          MINITOR_MUTEX_GIVE( connection_access_mutex[dl_connection->mutex_index] );
-          // MUTEX GIVE
-        }
-        else if
-        (
-          ( connections_poll[dl_connection->poll_index].revents & connections_poll[dl_connection->poll_index].events ) != 0 ||
-          ( dl_connection->is_or == 1 && wolfSSL_pending( dl_connection->ssl ) > 0 )
-        )
+        if ( has_data || err_bits )
         {
+          if ( err_bits )
+          {
+            MINITOR_LOG( CONN_TAG, "HUP drain conn_id=%d revents=%d", dl_connection->conn_id, revents );
+          }
           ready_connids[i] = dl_connection->conn_id;
+          needs_hup[i]     = err_bits != 0;
           i++;
         }
       }
@@ -389,6 +420,11 @@ void v_connections_daemon( void* pv_parameters )
           MINITOR_MUTEX_GIVE( access_mutex );
           // MUTEX GIVE
 
+          if ( needs_hup[i] )
+          {
+            v_cleanup_connection( ready_connection );
+          }
+
           break;
         }
 
@@ -406,6 +442,16 @@ void v_connections_daemon( void* pv_parameters )
         {
           MINITOR_MUTEX_GIVE( access_mutex );
           // MUTEX GIVE
+
+          // POLLHUP with nothing left to read: cleanup the connection now.
+          // access_mutex was just given back above; v_cleanup_connection()
+          // acquires both mutexes itself — do NOT call px_get_conn_by_id_and_lock
+          // first, that would take access_mutex and cause a deadlock.
+          if ( needs_hup[i] )
+          {
+            MINITOR_LOG( CONN_TAG, "HUP drained conn_id=%d, cleaning up", ready_connids[i] );
+            v_cleanup_connection( ready_connection );
+          }
 
           break;
         }
@@ -525,6 +571,68 @@ static DlConnection* px_create_or_connection( uint32_t address, uint16_t port )
 
   or_connection->status = CONNECTION_WANT_VERSIONS;
 
+  // Do the link protocol synchronously so this connection is CONNECTION_LIVE
+  // before we return. Without this, the daemon blocks in px_create_or_connection
+  // for the next circuit while CONN_HANDSHAKE cells from this guard pile up
+  // unprocessed — the relay times out and closes before we ever respond.
+  {
+    Cell* lc = NULL;
+    int lc_len;
+
+    lc_len = d_recv_cell( or_connection->ssl, (uint8_t**)&lc, LEGACY_CIRCID_LEN );
+    or_connection->has_versions = true;
+    if ( lc_len <= 0 || ((CellShortVariable*)lc)->command != VERSIONS )
+    {
+      if ( lc != NULL ) { free( lc ); }
+      MINITOR_LOG( CONN_TAG, "sync link: VERSIONS fail" );
+      goto clean_link_proto;
+    }
+    v_process_versions( or_connection, (CellShortVariable*)lc, lc_len );
+    free( lc ); lc = NULL;
+    or_connection->status = CONNECTION_WANT_CERTS;
+
+    lc_len = d_recv_cell( or_connection->ssl, (uint8_t**)&lc, CIRCID_LEN );
+    if ( lc_len <= 0 || ((CellVariable*)lc)->command != CERTS || d_process_certs( or_connection, (CellVariable*)lc, lc_len ) < 0 )
+    {
+      if ( lc != NULL ) { free( lc ); }
+      MINITOR_LOG( CONN_TAG, "sync link: CERTS fail" );
+      goto clean_link_proto;
+    }
+    free( lc ); lc = NULL;
+    or_connection->status = CONNECTION_WANT_CHALLENGE;
+
+    lc_len = d_recv_cell( or_connection->ssl, (uint8_t**)&lc, CIRCID_LEN );
+    if ( lc_len <= 0 || ((CellVariable*)lc)->command != AUTH_CHALLENGE )
+    {
+      if ( lc != NULL ) { free( lc ); }
+      MINITOR_LOG( CONN_TAG, "sync link: AUTH_CHALLENGE fail" );
+      goto clean_link_proto;
+    }
+    free( lc ); lc = NULL;
+    // We are a client (hidden service), not a relay — skip AUTHENTICATE.
+    // Free the RSA auth material that d_start_v3_handshake allocated.
+    wc_FreeRsaKey( &or_connection->initiator_rsa_auth_key );
+    if ( or_connection->responder_rsa_identity_key_der != NULL ) { free( or_connection->responder_rsa_identity_key_der ); or_connection->responder_rsa_identity_key_der = NULL; }
+    if ( or_connection->initiator_rsa_identity_key_der != NULL ) { free( or_connection->initiator_rsa_identity_key_der ); or_connection->initiator_rsa_identity_key_der = NULL; }
+    wc_Sha256Free( &or_connection->responder_sha );
+    wc_Sha256Free( &or_connection->initiator_sha );
+    // wolfSSL arrays (master_secret etc.) no longer needed after link setup
+    wolfSSL_FreeArrays( or_connection->ssl );
+    or_connection->status = CONNECTION_WANT_NETINFO;
+
+    lc_len = d_recv_cell( or_connection->ssl, (uint8_t**)&lc, CIRCID_LEN );
+    if ( lc_len <= 0 || ((Cell*)lc)->command != NETINFO || d_process_netinfo( or_connection, lc ) < 0 )
+    {
+      if ( lc != NULL ) { free( lc ); }
+      MINITOR_LOG( CONN_TAG, "sync link: NETINFO fail" );
+      goto clean_connection; // RSA already freed in skip-AUTHENTICATE block
+    }
+    free( lc ); lc = NULL;
+    or_connection->status = CONNECTION_LIVE;
+
+    MINITOR_LOG( CONN_TAG, "sync link OK conn_id=%d", or_connection->conn_id );
+  }
+
   v_add_connection_to_list( or_connection, &connections );
 
   if ( connections_daemon_task_handle == NULL )
@@ -570,6 +678,20 @@ static DlConnection* px_create_or_connection( uint32_t address, uint16_t port )
 
   return or_connection;
 
+clean_link_proto:
+  // RSA keys and SHA contexts were allocated by d_start_v3_handshake.
+  // Free them for any failure before WANT_NETINFO (at which point we have
+  // already freed them explicitly in the skip-AUTHENTICATE block above).
+  if ( or_connection->status == CONNECTION_WANT_VERSIONS ||
+       or_connection->status == CONNECTION_WANT_CERTS    ||
+       or_connection->status == CONNECTION_WANT_CHALLENGE )
+  {
+    wc_FreeRsaKey( &or_connection->initiator_rsa_auth_key );
+    if ( or_connection->responder_rsa_identity_key_der != NULL ) { free( or_connection->responder_rsa_identity_key_der ); or_connection->responder_rsa_identity_key_der = NULL; }
+    if ( or_connection->initiator_rsa_identity_key_der != NULL ) { free( or_connection->initiator_rsa_identity_key_der ); or_connection->initiator_rsa_identity_key_der = NULL; }
+    wc_Sha256Free( &or_connection->responder_sha );
+    wc_Sha256Free( &or_connection->initiator_sha );
+  }
 clean_connection:
   free( or_connection );
 clean_ssl:
@@ -585,6 +707,7 @@ int d_attach_or_connection( uint32_t address, uint16_t port, OnionCircuit* circu
 {
   int i;
   DlConnection* dl_connection;
+  DlConnection* live_guard = NULL;
 
   // MUTEX TAKE
   MINITOR_MUTEX_TAKE_BLOCKING( connections_mutex );
@@ -598,19 +721,43 @@ int d_attach_or_connection( uint32_t address, uint16_t port, OnionCircuit* circu
       break;
     }
 
+    // Entry-guard model: track any live OR connection as potential guard reuse.
+    if ( dl_connection->is_or == 1 && dl_connection->status == CONNECTION_LIVE && live_guard == NULL )
+    {
+      live_guard = dl_connection;
+    }
+
     dl_connection = dl_connection->next;
   }
 
   if ( dl_connection == NULL )
   {
-    dl_connection = px_create_or_connection( address, port );
-
-    if ( dl_connection == NULL )
+    if ( live_guard != NULL )
     {
-      MINITOR_MUTEX_GIVE( connections_mutex );
-      // MUTEX GIVE
+      // Reuse existing guard connection. Update circuit's head relay to use
+      // the guard's identity/ntor_key so CREATE2 targets the right relay.
+      MINITOR_LOG( CONN_TAG, "guard reuse conn_id=%d for circ=%x", live_guard->conn_id, circuit->circ_id );
+      circuit->relay_list.head->relay->address  = live_guard->address;
+      circuit->relay_list.head->relay->or_port  = live_guard->port;
+      memcpy( circuit->relay_list.head->relay->identity,      live_guard->guard_identity, 20 );
+      memcpy( circuit->relay_list.head->relay->ntor_onion_key, live_guard->guard_ntor_key, 32 );
+      dl_connection = live_guard;
+    }
+    else
+    {
+      dl_connection = px_create_or_connection( address, port );
 
-      return -1;
+      if ( dl_connection == NULL )
+      {
+        MINITOR_MUTEX_GIVE( connections_mutex );
+        // MUTEX GIVE
+
+        return -1;
+      }
+
+      // Store the relay keys for future circuits reusing this guard connection.
+      memcpy( dl_connection->guard_identity,  circuit->relay_list.head->relay->identity,      20 );
+      memcpy( dl_connection->guard_ntor_key,  circuit->relay_list.head->relay->ntor_onion_key, 32 );
     }
   }
 

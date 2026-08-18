@@ -65,6 +65,8 @@ typedef struct DlConnection
   uint32_t cell_ring_end;
   uint8_t* cell_ring_buf[RING_BUF_LEN];
   uint8_t master_secret[48];
+  uint8_t guard_identity[20];    // SHA1 identity of first-hop relay
+  uint8_t guard_ntor_key[32];    // ntor-onion-key of first-hop relay
 } DlConnection;
 
 void v_add_connection_to_list( DlConnection* connection, DlConnection** list );

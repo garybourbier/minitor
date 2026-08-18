@@ -19,6 +19,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include <time.h>
 
+/* Exposed to tor_ssh.cpp for display progress */
+volatile int g_minitor_relay_count = 0;
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/select.h>
+
 #include "wolfssl/options.h"
 
 #include "wolfssl/wolfcrypt/sha.h"
@@ -133,6 +139,7 @@ void v_handle_crypto_and_insert( void* pv_parameters )
 #endif
 
     process_count++;
+    g_minitor_relay_count = process_count;
 #endif
 
     if ( onion_relay->hsdir == true )
@@ -1183,16 +1190,49 @@ static int d_download_consensus()
     return -1;
   }
 
-  // connect the socket to the dir server address
-  err = connect( sock_fd, (struct sockaddr*) &dest_addr, sizeof( dest_addr ) );
+  // connect with a 10-second timeout via non-blocking + select().
+  // Without this, lwIP's default TCP SYN timeout (~75s) freezes the device
+  // when a directory authority is unreachable.
+  {
+    int fl = fcntl( sock_fd, F_GETFL, 0 );
+    fcntl( sock_fd, F_SETFL, fl | O_NONBLOCK );
+    err = connect( sock_fd, (struct sockaddr*) &dest_addr, sizeof( dest_addr ) );
+    if ( err < 0 && errno == EINPROGRESS )
+    {
+      fd_set wfds;
+      struct timeval tv = { 10, 0 };
+      FD_ZERO( &wfds );
+      FD_SET( sock_fd, &wfds );
+      err = select( sock_fd + 1, NULL, &wfds, NULL, &tv );
+      if ( err > 0 )
+      {
+        int so_err = 0;
+        socklen_t so_len = sizeof( so_err );
+        getsockopt( sock_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len );
+        err = ( so_err == 0 ) ? 0 : -1;
+      }
+      else
+      {
+        err = -1; /* timeout or select error */
+      }
+    }
+    fcntl( sock_fd, F_SETFL, fl ); /* restore blocking */
+  }
 
   if ( err != 0 )
   {
-    MINITOR_LOG( MINITOR_TAG, "couldn't connect to http server" );
+    MINITOR_LOG( MINITOR_TAG, "couldn't connect to http server %s", ip_addr_str );
 
     close( sock_fd );
 
     return -1;
+  }
+
+  // Set recv/send timeout so a stalled download doesn't block forever
+  {
+    struct timeval tv = { 30, 0 };
+    setsockopt( sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof( tv ) );
+    setsockopt( sock_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof( tv ) );
   }
 
   // send the http request to the dir server

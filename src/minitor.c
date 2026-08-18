@@ -18,6 +18,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #include <stddef.h>
 #include <stdlib.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "../include/config.h"
 #include "../include/minitor.h"
@@ -162,10 +164,11 @@ int d_minitor_INIT()
 
   MINITOR_LOG( MINITOR_TAG, "Starting fetch" );
 
-  // fetch network consensus
+  // fetch network consensus — retry until one DA responds
   while ( d_fetch_consensus_info() < 0 )
   {
     MINITOR_LOG( MINITOR_TAG, "Fetch failed, retrying" );
+    vTaskDelay( pdMS_TO_TICKS( 3000 ) );
   }
 
   return 0;

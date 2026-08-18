@@ -559,7 +559,7 @@ int d_derive_blinded_pubkey( ed25519_key* blinded_key, uint8_t* master_pubkey, i
   wc_InitSha3_256( &keyblind_sha3, NULL, INVALID_DEVID );
 
   // calculate h
-  wc_Sha3_256_Update( &keyblind_sha3, (unsigned char*)"Derive temporary signing key", strlen( "Derive temporary signing key" ) + 1 );
+  wc_Sha3_256_Update( &keyblind_sha3, (unsigned char*)"Derive temporary signing key", strlen( "Derive temporary signing key" ) );
   wc_Sha3_256_Update( &keyblind_sha3, master_pubkey, ED25519_PUB_KEY_SIZE );
 
   if ( secret != NULL )

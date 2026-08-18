@@ -488,7 +488,7 @@ static void v_handle_tor_cell( uint32_t conn_id )
     return;
   }
 
-  MINITOR_LOG( CORE_TAG, "status %d target %d", working_circuit->status, working_circuit->target_status );
+  MINITOR_LOG( CORE_TAG, "tor_cell: circ_id=%x cmd=%d status=%d target=%d", working_circuit->circ_id, cell->command, working_circuit->status, working_circuit->target_status );
 
   time( &(working_circuit->last_action) );
 
@@ -505,7 +505,7 @@ static void v_handle_tor_cell( uint32_t conn_id )
 
     if ( succ < 0 )
     {
-      MINITOR_LOG( CORE_TAG, "Failed to decrypt packed cell, discarding" );
+      MINITOR_LOG( CORE_TAG, "Failed to decrypt packed cell status=%d circ=%x", working_circuit->status, working_circuit->circ_id );
 
       MINITOR_MUTEX_GIVE( access_mutex );
       // MUTEX GIVE
@@ -535,11 +535,15 @@ static void v_handle_tor_cell( uint32_t conn_id )
     case CIRCUIT_CREATED:
       if ( cell->command != CREATED2 )
       {
+        MINITOR_LOG( CORE_TAG, "CREATED: not CREATED2, cmd=%d circ=%x reason=%d", cell->command, working_circuit->circ_id, cell->payload.destroy_code );
         goto circuit_rebuild;
       }
 
+      MINITOR_LOG( CORE_TAG, "CREATED2 ok circ=%x len=%d/%d", working_circuit->circ_id, working_circuit->relay_list.built_length, working_circuit->relay_list.length );
+
       if ( d_router_created2( working_circuit, cell ) < 0 )
       {
+        MINITOR_LOG( CORE_TAG, "d_router_created2 FAILED circ=%x", working_circuit->circ_id );
         goto circuit_rebuild;
       }
 
@@ -563,9 +567,7 @@ static void v_handle_tor_cell( uint32_t conn_id )
     case CIRCUIT_EXTENDED:
       if ( cell->command != RELAY || cell->payload.relay.relay_command != RELAY_EXTENDED2 )
       {
-        MINITOR_LOG( CORE_TAG, "failed to get extended" );
-        MINITOR_LOG( CORE_TAG, "circ_id: %x", working_circuit->circ_id );
-        MINITOR_LOG( CORE_TAG, "command: %x relay command: %x", cell->command, cell->payload.relay.relay_command );
+        MINITOR_LOG( CORE_TAG, "failed to get extended circ=%x cmd=%d relay_cmd=%d reason=%d", working_circuit->circ_id, cell->command, cell->payload.relay.relay_command, cell->payload.destroy_code );
 
         goto circuit_rebuild;
       }
@@ -741,8 +743,11 @@ static void v_handle_tor_cell( uint32_t conn_id )
 
       working_circuit->service->intro_live_count++;
 
+      MINITOR_LOG( CORE_TAG, "INTRO_LIVE circ=%x count=%d", working_circuit->circ_id, working_circuit->service->intro_live_count );
+
       if ( working_circuit->service->intro_live_count == 3 && working_circuit->service->hsdir_sent == 0 )
       {
+        MINITOR_LOG( CORE_TAG, "pushing hsdir descriptor" );
         if ( d_push_hsdir( working_circuit->service ) < 0 )
         {
           MINITOR_LOG( CORE_TAG, "Failed to start hsdir push" );
@@ -820,7 +825,7 @@ static void v_handle_tor_cell( uint32_t conn_id )
       }
       else
       {
-        // TODO check actual response for success
+        MINITOR_LOG( CORE_TAG, "hsdir data relay_cmd=%d idx=%d resp=%.50s", cell->payload.relay.relay_command, working_circuit->target_relay_index, (char*)cell->payload.relay.data );
 
         working_circuit->service->hsdir_sent++;
         working_circuit->target_relay_index++;
@@ -1231,6 +1236,8 @@ static void v_handle_conn_ready( uint32_t conn_id )
     return;
   }
 
+  MINITOR_LOG( CORE_TAG, "conn_ready: %d circuits conn_id=%d", i, conn_id );
+
   for ( f = i, i = i - 1; i >= 0; i-- )
   {
     ready_circuits[i]->want_action = true;
@@ -1238,10 +1245,15 @@ static void v_handle_conn_ready( uint32_t conn_id )
 
     if ( ready_circuits[i]->status == CIRCUIT_CREATE && d_send_circuit_create( ready_circuits[i], or_connection ) < 0 )
     {
+      MINITOR_LOG( CORE_TAG, "conn_ready: CREATE2 fail circ_id=%x", ready_circuits[i]->circ_id );
       f--;
 
       // don't pass in the or_connection, keeps our lock
       v_circuit_rebuild_or_destroy( ready_circuits[i], NULL );
+    }
+    else
+    {
+      MINITOR_LOG( CORE_TAG, "conn_ready: CREATE2 sent circ_id=%x", ready_circuits[i]->circ_id );
     }
   }
 
@@ -1407,6 +1419,7 @@ static void v_init_service( OnionService* service )
 
 void v_handle_circuit_timeout()
 {
+  MINITOR_LOG( CORE_TAG, "timeout check" );
   /*
   struct CircIdStreamId
   {
