@@ -513,6 +513,25 @@ static DlConnection* px_create_or_connection( uint32_t address, uint16_t port )
     return NULL;
   }
 
+  // Aggressive TCP keepalive on the OR connection.  An aggressive NAT (mobile /
+  // CGNAT) silently drops an idle connection without any FIN/RST reaching us, so
+  // a dead intro point is otherwise invisible: our padding write() keeps
+  // succeeding into the dead socket for ~15 min of TCP retransmits, the poll
+  // loop never sees POLLERR, and the intro is never rebuilt -> the service goes
+  // dark a few minutes after publishing.  With keepalive the kernel probes the
+  // peer after 20 s idle (below typical NAT timeouts, which also keeps a healthy
+  // mapping warm so intros stop dying in the first place); 3 unanswered probes
+  // 10 s apart (~50 s) mark the socket dead -> poll() returns POLLERR/POLLHUP ->
+  // v_cleanup_connection -> CONN_CLOSE -> circuit teardown + rebuild + descriptor
+  // republish, all through the existing machinery.
+  {
+    int ka_on = 1, ka_idle = 20, ka_intvl = 10, ka_cnt = 3;
+    setsockopt( sock_fd, SOL_SOCKET, SO_KEEPALIVE, &ka_on, sizeof( ka_on ) );
+    setsockopt( sock_fd, IPPROTO_TCP, TCP_KEEPIDLE, &ka_idle, sizeof( ka_idle ) );
+    setsockopt( sock_fd, IPPROTO_TCP, TCP_KEEPINTVL, &ka_intvl, sizeof( ka_intvl ) );
+    setsockopt( sock_fd, IPPROTO_TCP, TCP_KEEPCNT, &ka_cnt, sizeof( ka_cnt ) );
+  }
+
   ssl = wolfSSL_new( xMinitorWolfSSL_Context );
 
   if ( ssl == NULL )
