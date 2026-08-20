@@ -2864,6 +2864,12 @@ int d_push_hsdir( OnionService* service )
 
     if ( tmp_circuit == NULL )
     {
+      // Fewer live intros than intro_live_count claimed — release the mutex we
+      // hold before bailing out, otherwise the daemon deadlocks on the next
+      // circuits_mutex take.
+      MINITOR_MUTEX_GIVE( circuits_mutex );
+      //MUTEX GIVE
+
       return -1;
     }
 

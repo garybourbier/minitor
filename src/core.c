@@ -403,8 +403,30 @@ circuit_destroy:
 
 void v_circuit_remove_destroy( OnionCircuit* circuit, DlConnection* or_connection )
 {
+  OnionService* republish_service = NULL;
+
   // MUTEX TAKE
   MINITOR_MUTEX_TAKE_BLOCKING( circuits_mutex );
+
+  // A live introduction point is going away.  intro_live_count is only ever
+  // incremented when an intro reaches CIRCUIT_INTRO_LIVE (see v_handle_tor_cell),
+  // so decrement it here to keep it accurate — otherwise the service believes it
+  // still has 3 live intros forever, never rebuilds when one dies silently, and
+  // becomes unreachable once the original intro relays drop us.
+  if ( circuit->service != NULL && circuit->status == CIRCUIT_INTRO_LIVE )
+  {
+    if ( circuit->service->intro_live_count > 0 )
+    {
+      circuit->service->intro_live_count--;
+    }
+
+    // The replacement intro will sit on a different relay, so the published
+    // descriptor becomes stale.  Schedule a re-push through the normal hsdir
+    // timer once we are out of this teardown — do NOT stomp hsdir_sent here: an
+    // intro can die mid-upload and zeroing the progress counter corrupts the
+    // multi-HSDir push accounting (double-free of the descriptor buffers).
+    republish_service = circuit->service;
+  }
 
   v_remove_circuit_from_list( circuit, &onion_circuits );
 
@@ -425,6 +447,15 @@ void v_circuit_remove_destroy( OnionCircuit* circuit, DlConnection* or_connectio
 
   d_destroy_onion_circuit( circuit, or_connection );
   // MUTEX GIVE
+
+  // A live intro was just torn down — schedule a descriptor re-push shortly so
+  // clients learn the replacement intro's relay.  90 s gives the rebuilt intro
+  // time to reach CIRCUIT_INTRO_LIVE; d_push_hsdir needs 3 live intros and
+  // reschedules itself (v_handle_scheduled_hsdir) if we are not there yet.
+  if ( republish_service != NULL )
+  {
+    MINITOR_TIMER_SET_MS_BLOCKING( republish_service->hsdir_timer, 1000 * 90 );
+  }
 
   free( circuit );
 }
@@ -1278,9 +1309,12 @@ static void v_handle_scheduled_consensus()
 
 static void v_keep_circuitlist_alive()
 {
+  int i;
   Cell* padding_cell;
   DlConnection* or_connection;
   OnionCircuit* working_circuit;
+  OnionCircuit* dead_circuits[20];
+  int dead_count = 0;
 
   // MUTEX TAKE
   MINITOR_MUTEX_TAKE_BLOCKING( circuits_mutex );
@@ -1308,6 +1342,18 @@ static void v_keep_circuitlist_alive()
     if ( d_send_cell_and_free( or_connection, padding_cell ) < 0 )
     {
       MINITOR_LOG( CORE_TAG, "Failed to send padding cell on circ_id: %d", working_circuit->circ_id );
+
+      // The OR connection is dead — a silent drop (WiFi NAT timeout / relay
+      // dropping an idle connection without a DESTROY reaching us).  INTRO_LIVE
+      // circuits have want_action=false, so the timeout watchdog never rebuilds
+      // them; keepalive is their only liveness detector.  Without rebuilding
+      // here the intro point stays dead and the service becomes unreachable
+      // after a while.  Collect it and rebuild once circuits_mutex is released.
+      if ( dead_count < 20 )
+      {
+        dead_circuits[dead_count] = working_circuit;
+        dead_count++;
+      }
     }
 
     MINITOR_MUTEX_GIVE( connection_access_mutex[or_connection->mutex_index] );
@@ -1318,6 +1364,24 @@ static void v_keep_circuitlist_alive()
 
   MINITOR_MUTEX_GIVE( circuits_mutex );
   // MUTEX GIVE
+
+  // Rebuild (or destroy) the circuits whose keepalive failed, outside
+  // circuits_mutex — v_circuit_rebuild_or_destroy re-takes it internally.  Runs
+  // in the core task, same as every other circuit teardown, so the collected
+  // pointers cannot be freed concurrently between the two loops.
+  for ( i = dead_count - 1; i >= 0; i-- )
+  {
+    // MUTEX TAKE
+    or_connection = px_get_conn_by_id_and_lock( dead_circuits[i]->conn_id );
+
+    if ( or_connection == NULL )
+    {
+      continue;
+    }
+
+    v_circuit_rebuild_or_destroy( dead_circuits[i], or_connection );
+    // MUTEX GIVE
+  }
 
   MINITOR_TIMER_RESET_BLOCKING( keepalive_timer );
 }
