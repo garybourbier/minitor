@@ -421,10 +421,15 @@ void v_circuit_remove_destroy( OnionCircuit* circuit, DlConnection* or_connectio
     }
 
     // The replacement intro will sit on a different relay, so the published
-    // descriptor becomes stale.  Schedule a re-push through the normal hsdir
-    // timer once we are out of this teardown — do NOT stomp hsdir_sent here: an
+    // descriptor becomes stale and clients that fetch it try to introduce
+    // through dead intros (HOST UNREACHABLE, no INTRODUCE2 ever reaches us).
+    // Flag the service so that once a rebuilt intro brings intro_live_count back
+    // to 3, the CIRCUIT_INTRO_LIVE handler republishes the descriptor with the
+    // new intro set (see v_handle_tor_cell).  We do NOT stomp hsdir_sent here: an
     // intro can die mid-upload and zeroing the progress counter corrupts the
-    // multi-HSDir push accounting (double-free of the descriptor buffers).
+    // multi-HSDir push accounting (double-free of the descriptor buffers) — the
+    // flag is cleared safely by d_push_hsdir which resets that accounting itself.
+    circuit->service->needs_republish = 1;
     republish_service = circuit->service;
   }
 
@@ -776,12 +781,27 @@ static void v_handle_tor_cell( uint32_t conn_id )
 
       MINITOR_LOG( CORE_TAG, "INTRO_LIVE circ=%x count=%d", working_circuit->circ_id, working_circuit->service->intro_live_count );
 
-      if ( working_circuit->service->intro_live_count == 3 && working_circuit->service->hsdir_sent == 0 )
+      // Publish (or REPUBLISH) the descriptor once three intros are live.
+      //  - hsdir_sent == 0: the very first publish, before any push has run.
+      //  - needs_republish && hsdir_sent == hsdir_to_send: an intro died and was
+      //    rebuilt onto a new relay, so the descriptor on the HSDirs is stale and
+      //    clients try to introduce through dead intros (HOST UNREACHABLE).  We
+      //    only re-push once the previous push has fully completed
+      //    (hsdir_sent == hsdir_to_send) so we never re-enter d_push_hsdir while
+      //    a multi-HSDir upload is still in flight.
+      if ( working_circuit->service->intro_live_count == 3 &&
+           ( working_circuit->service->hsdir_sent == 0 ||
+             ( working_circuit->service->needs_republish &&
+               working_circuit->service->hsdir_sent == working_circuit->service->hsdir_to_send ) ) )
       {
+        working_circuit->service->needs_republish = 0;
+
         MINITOR_LOG( CORE_TAG, "pushing hsdir descriptor" );
         if ( d_push_hsdir( working_circuit->service ) < 0 )
         {
           MINITOR_LOG( CORE_TAG, "Failed to start hsdir push" );
+          // couldn't push now — keep the flag so a later intro event retries
+          working_circuit->service->needs_republish = 1;
           v_set_hsdir_timer( working_circuit->service->hsdir_timer );
         }
       }
@@ -1307,14 +1327,34 @@ static void v_handle_scheduled_consensus()
   }
 }
 
+// Rotate one live intro point every this many keepalive ticks.  Keepalive runs
+// every 2 min, so 2 ticks ≈ 4 min per intro, ~12 min for a full set of 3.  This
+// is the recovery path for a SILENTLY dead intro: on a flaky mobile NAT the intro
+// relay stops routing introductions to us without any DESTROY/TRUNCATED reaching
+// the board (the guard socket stays alive, so keepalive and the DESTROY-rebuild
+// path never fire) — the intro_live_count stays 3 while the published descriptor
+// points at a dead relay and clients get HOST UNREACHABLE.  Proactively tearing
+// one live intro down and rebuilding it evacuates the dead one and, through the
+// needs_republish flag, republishes the descriptor with the fresh intro set.  We
+// rotate ONE at a time and only when the service has all 3 live, so the set never
+// drops below 2 intros and this never turns into the old brute-force storm.
+#define ROTATE_INTRO_EVERY_N_KEEPALIVES 2
+
 static void v_keep_circuitlist_alive()
 {
+  static int rotate_tick = 0;
+  int do_rotate;
+
   int i;
   Cell* padding_cell;
   DlConnection* or_connection;
   OnionCircuit* working_circuit;
   OnionCircuit* dead_circuits[20];
   int dead_count = 0;
+  OnionCircuit* rotate_intro = NULL;
+
+  rotate_tick++;
+  do_rotate = ( rotate_tick % ROTATE_INTRO_EVERY_N_KEEPALIVES ) == 0;
 
   // MUTEX TAKE
   MINITOR_MUTEX_TAKE_BLOCKING( circuits_mutex );
@@ -1355,6 +1395,18 @@ static void v_keep_circuitlist_alive()
         dead_count++;
       }
     }
+    // Padding succeeded, so this circuit looks alive from our side — but that
+    // means nothing for a silently dead intro.  On a rotation tick pick exactly
+    // one live intro (only when the service has its full 3, so we never drop
+    // below 2) and rebuild it below.  Guaranteed distinct from dead_circuits: a
+    // circuit is here only because its padding write did NOT fail.
+    else if ( do_rotate && rotate_intro == NULL
+              && working_circuit->status == CIRCUIT_INTRO_LIVE
+              && working_circuit->service != NULL
+              && working_circuit->service->intro_live_count == 3 )
+    {
+      rotate_intro = working_circuit;
+    }
 
     MINITOR_MUTEX_GIVE( connection_access_mutex[or_connection->mutex_index] );
     // MUTEX GIVE
@@ -1383,6 +1435,26 @@ static void v_keep_circuitlist_alive()
     // MUTEX GIVE
   }
 
+  // Gentle intro rotation: tear the one selected live intro down.  Its
+  // target_status is CIRCUIT_ESTABLISH_INTRO, so v_circuit_rebuild_or_destroy
+  // spins up a fresh replacement intro (v_send_init_circuit_intro) and
+  // v_circuit_remove_destroy decrements intro_live_count + sets needs_republish
+  // (status is still CIRCUIT_INTRO_LIVE here) — once the replacement reaches
+  // INTRO_LIVE the descriptor is republished with the new intro set.  Same core
+  // task, so the pointer stays valid until we free it here.
+  if ( rotate_intro != NULL )
+  {
+    // MUTEX TAKE
+    or_connection = px_get_conn_by_id_and_lock( rotate_intro->conn_id );
+
+    if ( or_connection != NULL )
+    {
+      MINITOR_LOG( CORE_TAG, "rotating intro circ=%x", rotate_intro->circ_id );
+      v_circuit_rebuild_or_destroy( rotate_intro, or_connection );
+      // MUTEX GIVE
+    }
+  }
+
   MINITOR_TIMER_RESET_BLOCKING( keepalive_timer );
 }
 
@@ -1393,6 +1465,13 @@ static void v_handle_scheduled_hsdir( OnionService* service )
     MINITOR_LOG( CORE_TAG, "Failed to push hsdir for service on port: %d", service->local_port );
 
     MINITOR_TIMER_RESET_BLOCKING( service->hsdir_timer );
+  }
+  else
+  {
+    // Backup republish path (timer scheduled from v_circuit_remove_destroy after
+    // an intro died) succeeded — clear the flag so the intro-live handler does
+    // not push a redundant duplicate for this same rotation.
+    service->needs_republish = 0;
   }
 }
 
@@ -1406,6 +1485,7 @@ static void v_init_service( OnionService* service )
   int duplicate;
 
   service->intro_live_count = 0;
+  service->needs_republish = 0;
 
   v_add_service_to_list( service, &onion_services );
 

@@ -51,6 +51,7 @@ typedef struct OnionService
   time_t rend_timestamp;
   MinitorTimer hsdir_timer;
   int intro_live_count;
+  int needs_republish;
   int hsdir_sent;
   int hsdir_to_send;
   DoublyLinkedOnionRelayList* target_relays[2];
