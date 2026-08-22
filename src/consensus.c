@@ -21,6 +21,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 /* Exposed to tor_ssh.cpp for display progress */
 volatile int g_minitor_relay_count = 0;
+
+/* Optional progress callback, invoked from the relay-processing task during the
+ * consensus fetch. Runs on the same task that does the SD relay inserts, so a
+ * host app can safely draw to a shared SPI display from it. */
+void (*minitor_progress_cb)(int) = 0;
+void v_set_minitor_progress_cb(void (*cb)(int)) { minitor_progress_cb = cb; }
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/select.h>
@@ -140,6 +146,11 @@ void v_handle_crypto_and_insert( void* pv_parameters )
 
     process_count++;
     g_minitor_relay_count = process_count;
+
+    if ( minitor_progress_cb != NULL && process_count % 50 == 0 )
+    {
+      minitor_progress_cb( process_count );
+    }
 #endif
 
     if ( onion_relay->hsdir == true )
