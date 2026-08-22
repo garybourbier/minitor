@@ -1583,6 +1583,19 @@ int d_fetch_consensus_info()
 
   time( &now );
 
+  // Guard: a mirror can serve an already-expired consensus.  Publishing with it
+  // derives a past time period, so every HSDir rejects the descriptor (400) and
+  // the service is unreachable.  Reject it and fail so the caller reschedules a
+  // fetch, which re-picks a mirror (eventually a directory authority) carrying a
+  // fresh consensus.
+  if ( network_consensus.valid_until <= now )
+  {
+    MINITOR_LOG( MINITOR_TAG, "downloaded consensus already expired (valid_until=%ld now=%ld), retrying", (long)network_consensus.valid_until, (long)now );
+
+    ret = -1;
+    goto finish;
+  }
+
 #ifdef MINITOR_CHUTNEY
   // in chutney we want to update when a new shared rand is expected, not when we lose freshness
   voting_interval = network_consensus.fresh_until - network_consensus.valid_after;
@@ -1600,7 +1613,20 @@ int d_fetch_consensus_info()
 
   MINITOR_TIMER_SET_MS_BLOCKING( consensus_timer, 1000 * ( next_srv_time - now ) );
 #else
-  MINITOR_TIMER_SET_MS_BLOCKING( consensus_timer, 1000 * ( network_consensus.valid_until - now ) );
+  // Guard: never underflow the refetch interval.  If the consensus is at/near
+  // expiry (clock skew, valid_until == now), refetch soon instead of computing a
+  // negative interval that wraps to a huge delay and strands the board on a
+  // stale consensus until reboot.
+  {
+    time_t refresh_in = network_consensus.valid_until - now;
+
+    if ( refresh_in <= 0 )
+    {
+      refresh_in = 60;
+    }
+
+    MINITOR_TIMER_SET_MS_BLOCKING( consensus_timer, 1000 * refresh_in );
+  }
 #endif
 
   MINITOR_LOG( MINITOR_TAG, "finished fetching consensus" );
