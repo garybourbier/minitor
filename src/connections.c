@@ -818,6 +818,18 @@ void v_handle_local_connection( void* pv_parameters )
   }
 }
 
+// Address that incoming hidden-service streams are forwarded to. Defaults to
+// loopback (the on-device service). Repoint it (v_set_local_connection_addr) at
+// another host — e.g. a LAN machine — to use the board as a Tor gateway that
+// relays .onion connections to a full-power backend.
+static char local_connection_addr[16] = "127.0.0.1";
+
+void v_set_local_connection_addr( const char* addr )
+{
+  strncpy( local_connection_addr, addr, sizeof( local_connection_addr ) - 1 );
+  local_connection_addr[sizeof( local_connection_addr ) - 1] = '\0';
+}
+
 int d_create_local_connection( uint32_t circ_id, uint16_t stream_id, uint16_t port )
 {
   int i;
@@ -831,8 +843,8 @@ int d_create_local_connection( uint32_t circ_id, uint16_t stream_id, uint16_t po
   // MUTEX TAKE
   MINITOR_MUTEX_TAKE_BLOCKING( connections_mutex );
 
-  // set the address of the directory server
-  dest_addr.sin_addr.s_addr = inet_addr( "127.0.0.1" );
+  // forward the incoming stream to the configured backend (loopback by default)
+  dest_addr.sin_addr.s_addr = inet_addr( local_connection_addr );
   dest_addr.sin_family = AF_INET;
   dest_addr.sin_port = htons( port );
 

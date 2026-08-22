@@ -15,6 +15,7 @@ void v_poll_daemon( void* pv_parameters );
 void v_connections_daemon( void* pv_parameters );
 void v_handle_local_connection( void* pv_parameters );
 int d_attach_or_connection( uint32_t address, uint16_t port, OnionCircuit* circuit );
+void v_set_local_connection_addr( const char* addr );
 int d_create_local_connection( uint32_t circ_id, uint16_t stream_id, uint16_t port );
 int d_forward_to_local_connection( uint32_t circ_id, uint32_t stream_id, uint8_t* data, uint32_t length );
 void v_cleanup_local_connection( uint32_t circ_id, uint32_t stream_id );
