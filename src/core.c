@@ -32,6 +32,20 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 static const char* CORE_TAG = "MINITOR DAEMON";
 
+// Storm guard.  A burst of consecutive circuit/handshake failures almost always
+// means our cached consensus has gone stale (relay ntor onion keys rotated out
+// from under us): every rebuild re-fails with the wrong keys and the daemon
+// spins building circuits without backoff (seen as ~thousands of dead circuits
+// on a bad 4G/5G window).  Rather than throttle the per-circuit rebuild path
+// (which owns crypto/relay pointers and was just stabilized), we attack the root
+// cause: after this many consecutive failures pull a FRESH consensus early via
+// the existing scheduled path.  Fresh relay keys make handshakes succeed again
+// and the storm ends.  The streak resets on the first successful handshake, and
+// we zero it when arming so re-fetches are naturally rate-limited (at most one
+// per THRESHOLD failures).
+#define HANDSHAKE_FAIL_REFETCH_THRESHOLD 25
+static int handshake_fail_streak = 0;
+
 MinitorTimer keepalive_timer;
 MinitorTimer timeout_timer;
 OnionCircuit* onion_circuits = NULL;
@@ -577,6 +591,9 @@ static void v_handle_tor_cell( uint32_t conn_id )
 
       MINITOR_LOG( CORE_TAG, "CREATED2 ok circ=%x len=%d/%d", working_circuit->circ_id, working_circuit->relay_list.built_length, working_circuit->relay_list.length );
 
+      // a good handshake -> network/consensus are healthy again, clear the streak
+      handshake_fail_streak = 0;
+
       if ( d_router_created2( working_circuit, cell ) < 0 )
       {
         MINITOR_LOG( CORE_TAG, "d_router_created2 FAILED circ=%x", working_circuit->circ_id );
@@ -1054,6 +1071,15 @@ static void v_handle_tor_cell( uint32_t conn_id )
   return;
 
 circuit_rebuild:
+  // storm guard: too many consecutive failures -> cached consensus is likely
+  // stale, pull a fresh one early instead of only waiting for the slow timer.
+  if ( ++handshake_fail_streak >= HANDSHAKE_FAIL_REFETCH_THRESHOLD )
+  {
+    MINITOR_LOG( CORE_TAG, "handshake fail streak %d -> early consensus refetch", handshake_fail_streak );
+    handshake_fail_streak = 0;
+    MINITOR_TIMER_SET_MS_BLOCKING( consensus_timer, 500 );
+  }
+
   // this will give the mutex
   v_circuit_rebuild_or_destroy( working_circuit, or_connection );
   // MUTEX GIVE
