@@ -401,9 +401,11 @@ bool b_create_fetch_task( MinitorTask* handle, void* consensus )
 
 bool b_create_insert_task( MinitorTask* handle, void* consensus )
 {
-  // 16KB: crypto + DB insert for consensus entries
+  // 40KB (PSRAM): crypto + DB insert for consensus entries. Extra headroom over
+  // the base 16KB so the optional progress callback (minitor_progress_cb, invoked
+  // from this task) can draw to a TFT without overflowing the stack.
   return _pthread_create_with_stack( handle, v_handle_crypto_and_insert,
-                                     consensus, 16384 ) == 0;
+                                     consensus, 40960 ) == 0;
 }
 
 void port_task_delete( MinitorTask task )
