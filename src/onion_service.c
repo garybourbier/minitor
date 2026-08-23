@@ -175,6 +175,16 @@ void v_onion_service_handle_cell( OnionCircuit* circuit, DlConnection* or_connec
   return;
 
 circuit_rebuild:
+  // v_circuit_rebuild_or_destroy() releases connection_access_mutex (via
+  // d_destroy_onion_circuit), so it must be held here. Several cases above
+  // (RELAY_BEGIN / TRUNCATED / INTRODUCE2 / ...) already released it and set
+  // access_mutex = NULL before jumping here. Without re-taking it, d_destroy
+  // unlocks an unheld mutex -> pthread_mutex_unlock assert -> reboot, which is
+  // the intermittent crash seen under connection/rendezvous churn.
+  if ( access_mutex == NULL )
+  {
+    MINITOR_MUTEX_TAKE_BLOCKING( connection_access_mutex[or_connection->mutex_index] );
+  }
   // this will give the mutex
   v_circuit_rebuild_or_destroy( circuit, or_connection );
   // MUTEX GIVE
