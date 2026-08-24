@@ -1412,7 +1412,11 @@ static void v_keep_circuitlist_alive()
     time( &now );
     if ( network_consensus.fresh_until != 0 && now >= network_consensus.fresh_until )
     {
-      MINITOR_LOG( CORE_TAG, "consensus no longer fresh (now=%ld >= fresh_until=%ld), arming refetch", (long)now, (long)network_consensus.fresh_until );
+      MINITOR_LOG( CORE_TAG, "consensus no longer fresh (now=%ld >= fresh_until=%ld), forcing refetch", (long)now, (long)network_consensus.fresh_until );
+      // force a real network download: the cached consensus is still "valid" but
+      // stale, so d_download_consensus would otherwise just reuse it and keep a
+      // stale HSDir ring (every descriptor upload rejected 400).
+      g_force_consensus_download = 1;
       MINITOR_TIMER_SET_MS_BLOCKING( consensus_timer, 1000 );
     }
   }

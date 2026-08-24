@@ -1010,9 +1010,19 @@ static int d_parse_line_to_relay( OnionRelay* relay, char* line )
   return 0;
 }
 
+// Set by the keepalive freshness watchdog (core.c) when the loaded consensus is
+// past its fresh-until: forces the next fetch to actually hit the network
+// instead of reusing the still-"valid" (but stale) SD cache, which would keep an
+// out-of-date HSDir ring and get every descriptor upload rejected (400).
+// Consumed (cleared) on each d_download_consensus() call.
+int g_force_consensus_download = 0;
+
 static int d_download_consensus()
 {
   int ret = 0;
+  // consume the force flag: bypass the cache-reuse shortcut for this fetch
+  int forced = g_force_consensus_download;
+  g_force_consensus_download = 0;
   const char* REQUEST_FMT = "GET /tor/status-vote/current/consensus HTTP/1.0\r\n"
       "Host: %s\r\n"
       "User-Agent: esp-idf/1.0 esp3266\r\n"
@@ -1091,8 +1101,9 @@ static int d_download_consensus()
             time( &now );
             valid_until_time = d_parse_date_string( date_str );
 
-            // consensus is still valid
+            // consensus is still valid (and we weren't told to force a refresh)
             if (
+              !forced &&
               now < valid_until_time &&
               valid_until_time == d_get_hsdir_relay_valid_until() &&
               d_load_hsdir_relay_count() >= 0 &&

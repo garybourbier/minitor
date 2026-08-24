@@ -23,6 +23,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 extern MinitorMutex fastest_cache_mutex;
 
+// When set, the next consensus download bypasses the SD cache-reuse shortcut and
+// fetches fresh from the network (see d_download_consensus / the freshness
+// watchdog in core.c).  Cleared on each download attempt.
+extern int g_force_consensus_download;
+
 void v_handle_relay_fetch( void* pv_parameters );
 void v_handle_crypto_and_insert( void* pv_parameters );
 int d_get_hs_time_period( time_t fresh_until, time_t valid_after, int hsdir_interval );
