@@ -46,6 +46,20 @@ static const char* CORE_TAG = "MINITOR DAEMON";
 #define HANDSHAKE_FAIL_REFETCH_THRESHOLD 25
 static int handshake_fail_streak = 0;
 
+// Guard-death watchdog.  Minitor pins one entry guard: every circuit reuses the
+// first live OR connection (d_attach_or_connection).  On a flaky mobile NAT that
+// guard connection can die SILENTLY — the TCP socket stays up (so keepalive and
+// the POLLHUP-driven cleanup never fire) but the relay stops passing cells, so
+// every circuit built through it stalls waiting for the first-hop CREATED2 and
+// times out (status CIRCUIT_CREATED).  Intros and rendezvous then all fail and
+// the service is unreachable, yet the daemon keeps reusing the dead guard.  When
+// this many consecutive timeout passes see a CIRCUIT_CREATED (first-hop) timeout
+// with no successful CREATED2 in between, tear down that guard connection so the
+// next circuit picks a fresh guard.  The streak resets on any good CREATED2, so
+// a merely slow guard never trips it.
+#define GUARD_DEAD_TIMEOUT_PASSES 3
+static int      guard_create_timeout_streak = 0;
+
 MinitorTimer keepalive_timer;
 MinitorTimer timeout_timer;
 OnionCircuit* onion_circuits = NULL;
@@ -593,6 +607,8 @@ static void v_handle_tor_cell( uint32_t conn_id )
 
       // a good handshake -> network/consensus are healthy again, clear the streak
       handshake_fail_streak = 0;
+      // first-hop CREATED2 arrived -> the guard is passing cells, it's not dead
+      guard_create_timeout_streak = 0;
 
       if ( d_router_created2( working_circuit, cell ) < 0 )
       {
@@ -1627,6 +1643,11 @@ void v_handle_circuit_timeout()
   OnionCircuit* circuit;
   OnionCircuit* timed_out_circuits[20];
   DlConnection* dl_connection;
+  // guard-death detection: a first-hop (CIRCUIT_CREATED) timeout means the guard
+  // OR connection didn't answer our CREATE2; remember its conn_id so we can drop
+  // the guard below if this keeps happening.
+  int      create_timeouts = 0;
+  uint32_t create_timeout_conn = 0;
   /*
   struct CircIdStreamId timed_out_local[20];
   OnionMessage* onion_message;
@@ -1650,8 +1671,20 @@ void v_handle_circuit_timeout()
       {
         MINITOR_LOG( CORE_TAG, "timeout status: %d target_status: %d", circuit->status, circuit->target_status );
 
-        timed_out_circuits[i] = circuit;
-        i++;
+        // a CIRCUIT_CREATED timeout = the guard never returned CREATED2
+        if ( circuit->status == CIRCUIT_CREATED )
+        {
+          create_timeouts++;
+          create_timeout_conn = circuit->conn_id;
+        }
+
+        // bound the collection: overflowing timed_out_circuits[20] under a storm
+        // would corrupt the stack.  Extra circuits are caught next pass.
+        if ( i < 20 )
+        {
+          timed_out_circuits[i] = circuit;
+          i++;
+        }
       }
       else
       {
@@ -1681,6 +1714,32 @@ void v_handle_circuit_timeout()
 
     v_circuit_rebuild_or_destroy( timed_out_circuits[i], dl_connection );
     // MUTEX GIVE
+  }
+
+  // Guard-death watchdog: if first-hop handshakes keep timing out with no good
+  // CREATED2 clearing the streak (see v_handle_tor_cell), the pinned guard is
+  // silently dead.  Tear it down so d_attach_or_connection picks a fresh guard;
+  // its circuits are rebuilt via the CONN_CLOSE path.  v_cleanup_connection
+  // acquires connections_mutex + the access mutex itself, so release the access
+  // mutex from px_get_conn_by_id_and_lock first (see v_handle_conn_ready).
+  if ( create_timeouts > 0 )
+  {
+    guard_create_timeout_streak++;
+
+    if ( guard_create_timeout_streak >= GUARD_DEAD_TIMEOUT_PASSES )
+    {
+      MINITOR_LOG( CORE_TAG, "guard conn_id=%d silently dead (%d create-timeout passes) -> dropping guard", create_timeout_conn, guard_create_timeout_streak );
+
+      guard_create_timeout_streak = 0;
+
+      dl_connection = px_get_conn_by_id_and_lock( create_timeout_conn );
+
+      if ( dl_connection != NULL )
+      {
+        MINITOR_MUTEX_GIVE( connection_access_mutex[dl_connection->mutex_index] );
+        v_cleanup_connection( dl_connection );
+      }
+    }
   }
 
   /*
