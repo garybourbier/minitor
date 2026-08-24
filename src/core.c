@@ -1379,6 +1379,28 @@ static void v_keep_circuitlist_alive()
   int dead_count = 0;
   OnionCircuit* rotate_intro = NULL;
 
+  // Consensus freshness watchdog.  consensus_timer is one-shot and only re-arms
+  // itself on a *successful* fetch (d_fetch_consensus_info); if a scheduled
+  // refetch is ever lost (transient OOM, race, or a bad refetch interval) then
+  // nothing re-arms it and the board coasts on a stale consensus until reboot.
+  // A stale consensus means an out-of-date HSDir hash-ring, so every descriptor
+  // upload is rejected (HTTP 400) and the service becomes unreachable while the
+  // daemon otherwise looks healthy.  Independently of the timer, once the
+  // consensus is no longer fresh we arm a refetch here — this runs every
+  // keepalive tick (~2 min), so a lost timer self-heals within one tick.  We
+  // key off fresh_until (normal ~hourly voting cadence), keeping the ring
+  // aligned with the network; while the consensus stays fresh this is a no-op
+  // because a successful fetch has already armed the timer far out.
+  {
+    time_t now = 0;
+    time( &now );
+    if ( network_consensus.fresh_until != 0 && now >= network_consensus.fresh_until )
+    {
+      MINITOR_LOG( CORE_TAG, "consensus no longer fresh (now=%ld >= fresh_until=%ld), arming refetch", (long)now, (long)network_consensus.fresh_until );
+      MINITOR_TIMER_SET_MS_BLOCKING( consensus_timer, 1000 );
+    }
+  }
+
   rotate_tick++;
   do_rotate = ( rotate_tick % ROTATE_INTRO_EVERY_N_KEEPALIVES ) == 0;
 
