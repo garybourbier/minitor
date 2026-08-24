@@ -295,16 +295,24 @@ int d_destroy_onion_circuit( OnionCircuit* circuit, DlConnection* or_connection 
 
   for ( i = 0; i < circuit->relay_list.length; i++ )
   {
-    if ( i < circuit->relay_list.built_length )
+    // idempotent free: NULL after freeing so a second teardown path touching the
+    // same relay list (e.g. a truncate on a circuit being destroyed under a
+    // guard drop) is a no-op instead of a double-free / heap corruption.
+    if ( i < circuit->relay_list.built_length && tmp_relay_node->relay_crypto != NULL )
     {
       wc_ShaFree( &tmp_relay_node->relay_crypto->running_sha_forward );
       wc_ShaFree( &tmp_relay_node->relay_crypto->running_sha_backward );
       wc_AesFree( &tmp_relay_node->relay_crypto->aes_forward );
       wc_AesFree( &tmp_relay_node->relay_crypto->aes_backward );
       free( tmp_relay_node->relay_crypto );
+      tmp_relay_node->relay_crypto = NULL;
     }
 
-    free( tmp_relay_node->relay );
+    if ( tmp_relay_node->relay != NULL )
+    {
+      free( tmp_relay_node->relay );
+      tmp_relay_node->relay = NULL;
+    }
 
     if ( i == circuit->relay_list.length - 1 )
     {
@@ -368,20 +376,38 @@ int d_router_truncate( OnionCircuit* circuit, DlConnection* or_connection, int n
 
   for ( i = circuit->relay_list.length - 1; i >= new_length; i-- )
   {
-    if ( i < circuit->relay_list.built_length )
+    // defend against an inconsistent/partially-freed list (a concurrent teardown
+    // from a guard drop can shorten it under us): stop instead of walking off it.
+    if ( tmp_relay_node == NULL )
+    {
+      break;
+    }
+
+    // idempotent free: NULL after freeing so overlapping teardown paths don't
+    // double-free the same relay (heap corruption / reboot).
+    if ( i < circuit->relay_list.built_length && tmp_relay_node->relay_crypto != NULL )
     {
       wc_ShaFree( &tmp_relay_node->relay_crypto->running_sha_forward );
       wc_ShaFree( &tmp_relay_node->relay_crypto->running_sha_backward );
       wc_AesFree( &tmp_relay_node->relay_crypto->aes_forward );
       wc_AesFree( &tmp_relay_node->relay_crypto->aes_backward );
       free( tmp_relay_node->relay_crypto );
+      tmp_relay_node->relay_crypto = NULL;
     }
 
-    free( tmp_relay_node->relay );
+    if ( tmp_relay_node->relay != NULL )
+    {
+      free( tmp_relay_node->relay );
+      tmp_relay_node->relay = NULL;
+    }
 
     tmp_relay_node = tmp_relay_node->previous;
-    free( tmp_relay_node->next );
-    tmp_relay_node->next = NULL;
+
+    if ( tmp_relay_node != NULL )
+    {
+      free( tmp_relay_node->next );
+      tmp_relay_node->next = NULL;
+    }
   }
 
   circuit->relay_list.tail = tmp_relay_node;
