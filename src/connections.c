@@ -830,18 +830,17 @@ void v_set_local_connection_addr( const char* addr )
   local_connection_addr[sizeof( local_connection_addr ) - 1] = '\0';
 }
 
+// Bounded wait for the loopback backend to accept.  Runs on the core daemon
+// thread, so it must never block indefinitely (see below).
+#define LOCAL_CONNECT_TIMEOUT_MS 3000
+
 int d_create_local_connection( uint32_t circ_id, uint16_t stream_id, uint16_t port )
 {
-  int i;
   int succ;
-  bool ready;
   int sock_fd;
   struct sockaddr_in dest_addr;
   DlConnection* local_connection;
   MinitorTask* dummy_handle;
-
-  // MUTEX TAKE
-  MINITOR_MUTEX_TAKE_BLOCKING( connections_mutex );
 
   // forward the incoming stream to the configured backend (loopback by default)
   dest_addr.sin_addr.s_addr = inet_addr( local_connection_addr );
@@ -854,17 +853,64 @@ int d_create_local_connection( uint32_t circ_id, uint16_t stream_id, uint16_t po
   {
     MINITOR_LOG( CONN_TAG, "couldn't create a socket to the local port, err: %d, errno: %d", sock_fd, errno );
 
-    goto fail;
+    return -1;
   }
+
+  // Non-blocking connect with a bounded timeout, done OFF the connections_mutex.
+  // This runs on the single core daemon thread (RELAY_BEGIN handler): a blocking
+  // connect() here stalls ALL cell processing while the backend is slow to
+  // accept -> rendezvous circuits time out; and if the backend never accepts
+  // (listen backlog full under a burst of concurrent streams, e.g. the web
+  // panel opening many connections at once) the daemon freezes for good and the
+  // whole service dies.  Bound the wait, then hand a blocking socket to the
+  // per-connection recv thread.  The old code also held connections_mutex across
+  // the blocking connect(), serializing every other connection operation behind
+  // a potentially infinite stall.
+  fcntl( sock_fd, F_SETFL, O_NONBLOCK );
 
   succ = connect( sock_fd, (struct sockaddr*) &dest_addr, sizeof( dest_addr ) );
 
-  if ( succ != 0 )
+  if ( succ != 0 && errno != EINPROGRESS )
   {
-    MINITOR_LOG( CONN_TAG, "couldn't connect to the local port" );
+    MINITOR_LOG( CONN_TAG, "couldn't connect to the local port, errno: %d", errno );
 
     goto clean_socket;
   }
+
+  if ( succ != 0 )
+  {
+    struct pollfd pfd;
+    int poll_ret;
+    int so_err = 0;
+    socklen_t so_len = sizeof( so_err );
+
+    pfd.fd = sock_fd;
+    pfd.events = POLLOUT;
+
+    poll_ret = poll( &pfd, 1, LOCAL_CONNECT_TIMEOUT_MS );
+
+    if ( poll_ret <= 0 )
+    {
+      MINITOR_LOG( CONN_TAG, "local connect timed out or failed (poll=%d)", poll_ret );
+
+      goto clean_socket;
+    }
+
+    getsockopt( sock_fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len );
+
+    if ( so_err != 0 )
+    {
+      MINITOR_LOG( CONN_TAG, "local connect failed, so_err: %d", so_err );
+
+      goto clean_socket;
+    }
+  }
+
+  // hand a blocking socket to the recv-loop thread (px_recv_on_local_connection)
+  fcntl( sock_fd, F_SETFL, fcntl( sock_fd, F_GETFL, 0 ) & ~O_NONBLOCK );
+
+  // MUTEX TAKE — only to register the connection + spawn its handler
+  MINITOR_MUTEX_TAKE_BLOCKING( connections_mutex );
 
   local_connection = malloc( sizeof( DlConnection ) );
 
@@ -890,16 +936,18 @@ int d_create_local_connection( uint32_t circ_id, uint16_t stream_id, uint16_t po
 clean_socket:
   shutdown( sock_fd, 0 );
   close( sock_fd );
-fail:
-  MINITOR_MUTEX_GIVE( connections_mutex );
-  // MUTEX GIVE
 
   return -1;
 }
 
+// Bounded time we'll wait for the local backend to drain before dropping a
+// stream, so a slow/backpressuring backend can never freeze the core daemon.
+#define LOCAL_SEND_TIMEOUT_MS 2000
+
 int d_forward_to_local_connection( uint32_t circ_id, uint32_t stream_id, uint8_t* data, uint32_t length )
 {
   int ret = 0;
+  int sock_fd = -1;
   DlConnection* local_connection;
 
   local_connection = connections;
@@ -908,7 +956,7 @@ int d_forward_to_local_connection( uint32_t circ_id, uint32_t stream_id, uint8_t
   {
     if ( local_connection->is_or == 0 && local_connection->circ_id == circ_id && local_connection->stream_id == stream_id )
     {
-      ret = send( local_connection->sock_fd, data, length, 0 );
+      sock_fd = local_connection->sock_fd;
 
       break;
     }
@@ -918,7 +966,64 @@ int d_forward_to_local_connection( uint32_t circ_id, uint32_t stream_id, uint8_t
 
   if ( local_connection == NULL )
   {
-    ret = -1;
+    return -1;
+  }
+
+  // Deliver the whole buffer to the backend WITHOUT blocking the core daemon.
+  // This runs on the daemon thread (RELAY_DATA handler) while it holds the OR
+  // connection's access mutex, so a blocking send() here freezes ALL of Tor the
+  // moment the backend applies backpressure (slow to read — e.g. the web panel
+  // under a burst of concurrent requests, its recv buffer full).  Use
+  // MSG_DONTWAIT and a bounded poll wait; if the backend stays full past the
+  // timeout, drop this stream (the caller sends RELAY_END) instead of hanging.
+  {
+    uint32_t sent = 0;
+    int waited_ms = 0;
+
+    while ( sent < length )
+    {
+      int n = send( sock_fd, data + sent, length - sent, MSG_DONTWAIT );
+
+      if ( n > 0 )
+      {
+        sent += n;
+
+        continue;
+      }
+
+      if ( n < 0 && ( errno == EAGAIN || errno == EWOULDBLOCK ) )
+      {
+        struct pollfd pfd;
+
+        if ( waited_ms >= LOCAL_SEND_TIMEOUT_MS )
+        {
+          MINITOR_LOG( CONN_TAG, "local send backpressure timeout, dropping stream" );
+
+          ret = -1;
+          break;
+        }
+
+        pfd.fd = sock_fd;
+        pfd.events = POLLOUT;
+
+        // POLLOUT ready -> retry immediately; timeout/error -> count toward cap
+        if ( poll( &pfd, 1, 200 ) <= 0 )
+        {
+          waited_ms += 200;
+        }
+
+        continue;
+      }
+
+      // real error (EPIPE/EBADF/...) -> the stream is dead
+      ret = -1;
+      break;
+    }
+
+    if ( ret == 0 )
+    {
+      ret = (int)sent;
+    }
   }
 
   return ret;
