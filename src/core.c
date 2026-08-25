@@ -532,6 +532,14 @@ static void v_handle_tor_cell( uint32_t conn_id )
     return;
   }
 
+  // The guard just delivered a cell, so it is alive and passing traffic — clear
+  // the guard-death streak.  Under the web panel's load the guard carries plenty
+  // of cells for existing circuits even while some new circuits time out; keying
+  // guard-death off "no cells at all" (rather than just missing CREATED2) stops
+  // the watchdog from false-positiving and needlessly churning the intro set
+  // (which invalidates the published descriptor and breaks client connections).
+  guard_create_timeout_streak = 0;
+
   // MUTEX TAKE
   MINITOR_MUTEX_TAKE_BLOCKING( circuits_mutex );
 
