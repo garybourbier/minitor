@@ -12,8 +12,10 @@ const char* PORT_TAG = "PORT";
 
 // ESP-IDF default pthread stack is 3KB — way too small for wolfSSL TLS (needs ~16KB+).
 // Helper to create a pthread with explicit stack size.
+// pin_core >= 0 pins the task to that core; pin_core < 0 leaves the default
+// (no affinity — scheduler is free to place it, needed for CPU-bound tasks).
 static int _pthread_create_with_stack( pthread_t *thread, void *(*func)(void*),
-                                       void *arg, size_t stack_bytes )
+                                       void *arg, size_t stack_bytes, int pin_core )
 {
   pthread_attr_t attr;
   int ret;
@@ -23,6 +25,17 @@ static int _pthread_create_with_stack( pthread_t *thread, void *(*func)(void*),
   // esp_pthread_set_cfg applies to the next pthread_create() call only.
   esp_pthread_cfg_t pcfg = esp_pthread_get_default_config();
   pcfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+  // Only the poll task pins to core 0 (pin_core=0): it is the pure-I/O socket
+  // reader that must not be starved by the web panel's AsyncTCP task (core 1,
+  // CONFIG_ASYNC_TCP_RUNNING_CORE=1) — otherwise guard cells sit unread, circuits
+  // time out, and the guard is wrongly torn down (intro churn -> stale descriptor
+  // -> clients can't connect).  Every other task stays unpinned (pin_core<0):
+  // they run heavy wolfSSL bignum crypto (TLS handshakes, consensus parse) and
+  // pinning them to core 0 monopolised it, starving IDLE0 -> Task WDT reboot.
+  if ( pin_core >= 0 )
+  {
+    pcfg.pin_to_core = pin_core;
+  }
   esp_pthread_set_cfg( &pcfg );
 
   pthread_attr_init( &attr );
@@ -103,6 +116,7 @@ static int _timer_thread_create( MinitorTimer timer )
 {
   esp_pthread_cfg_t pcfg = esp_pthread_get_default_config();
   pcfg.stack_alloc_caps  = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+  pcfg.pin_to_core       = -1;  // keep timers on core 0 with the rest of Minitor
   esp_pthread_set_cfg( &pcfg );
 
   pthread_attr_t attr;
@@ -368,7 +382,8 @@ bool b_create_core_task( MinitorTask* handle )
   // handshake inline (unlike consensus fetch which uses separate pthreads).
   // wolfSSL TLS 1.3 + NTOR key exchange + 3-hop extension needs ~32KB of stack
   // frames; doubling from 32KB eliminates stack-overflow crashes during INIT_CIRCUIT.
-  return _pthread_create_with_stack( handle, v_minitor_daemon, NULL, 65536 ) == 0;
+  // core 0: latency-sensitive, processes guard cells (kept off the web server core)
+  return _pthread_create_with_stack( handle, v_minitor_daemon, NULL, 65536, -1 ) == 0;
 }
 
 bool b_create_connections_task( MinitorTask* handle )
@@ -376,27 +391,32 @@ bool b_create_connections_task( MinitorTask* handle )
   // 64KB: "CONNECTIONS DAEMON: Starting handshake" → wolfSSL TLS 1.3 runs here.
   // wolfSSL + NaCl/NTOR + cert chain parsing needs ~32KB of stack frames;
   // 32KB was overflowing after the first few intro-circuit handshakes.
-  return _pthread_create_with_stack( handle, v_connections_daemon, NULL, 65536 ) == 0;
+  // core 0: reads/handshakes OR connections (kept off the web server core)
+  return _pthread_create_with_stack( handle, v_connections_daemon, NULL, 65536, -1 ) == 0;
 }
 
 bool b_create_poll_task( MinitorTask* handle )
 {
-  // 16KB: poll loop, reads encrypted cells
-  return _pthread_create_with_stack( handle, v_poll_daemon, NULL, 16384 ) == 0;
+  // 16KB: poll loop, reads encrypted cells. core 0: THE critical socket reader —
+  // must not be starved by AsyncTCP (core 1) or guard cells sit unread.
+  return _pthread_create_with_stack( handle, v_poll_daemon, NULL, 16384, 0 ) == 0;
 }
 
 bool b_create_local_connection_handler( MinitorTask* handle, void* local_connection )
 {
-  // 16KB: proxies local SSH traffic through Tor circuit
+  // 16KB: proxies local SSH traffic through Tor circuit. core 0: light I/O, keep
+  // it with the rest of Minitor and off the web server core.
   return _pthread_create_with_stack( handle, v_handle_local_connection,
-                                     local_connection, 16384 ) == 0;
+                                     local_connection, 16384, -1 ) == 0;
 }
 
 bool b_create_fetch_task( MinitorTask* handle, void* consensus )
 {
-  // 32KB: fetches consensus/descriptors via TLS from directory servers
+  // 32KB: fetches consensus/descriptors via TLS. NOT pinned (-1): CPU-bound for
+  // minutes during bootstrap — pinning it to core 0 monopolised the core and
+  // starved IDLE0 -> Task WDT reboot.
   return _pthread_create_with_stack( handle, v_handle_relay_fetch,
-                                     consensus, 32768 ) == 0;
+                                     consensus, 32768, -1 ) == 0;
 }
 
 bool b_create_insert_task( MinitorTask* handle, void* consensus )
@@ -404,8 +424,10 @@ bool b_create_insert_task( MinitorTask* handle, void* consensus )
   // 40KB (PSRAM): crypto + DB insert for consensus entries. Extra headroom over
   // the base 16KB so the optional progress callback (minitor_progress_cb, invoked
   // from this task) can draw to a TFT without overflowing the stack.
+  // NOT pinned (-1): crypto-heavy for the whole consensus parse — pinning to
+  // core 0 starved IDLE0 -> Task WDT reboot.
   return _pthread_create_with_stack( handle, v_handle_crypto_and_insert,
-                                     consensus, 40960 ) == 0;
+                                     consensus, 40960, -1 ) == 0;
 }
 
 void port_task_delete( MinitorTask task )
