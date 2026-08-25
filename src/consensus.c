@@ -52,6 +52,12 @@ int fetch_speed_sample = 0;
 uint64_t fastest_fetch_time = 0xffffffffffffffff;
 uint8_t fastest_identity[ID_LENGTH];
 uint8_t previous_fastest_identity[ID_LENGTH];
+// When a chosen cache relay keeps failing to connect (it went down), the
+// descriptor-fetch retry sets this so d_get_suitable_dir_addr falls straight
+// through to the directory authorities (which served the consensus, so they're
+// reachable) instead of re-picking dead cache relays and stalling the boot.
+// Reset at the start of each relay-fetch cycle.
+int g_dir_prefer_authority = 0;
 
 MinitorMutex fastest_cache_mutex;
 MinitorQueue insert_relays_queue;
@@ -229,7 +235,7 @@ static int d_get_suitable_dir_addr( struct sockaddr_in* dest_addr, char* ip_addr
   char* authority_string;
   OnionRelay* cache_relay;
 
-  if ( d_get_staging_cache_relay_count() != 0 )
+  if ( !g_dir_prefer_authority && d_get_staging_cache_relay_count() != 0 )
   {
     // MUTEX TAKE
     MINITOR_MUTEX_TAKE_BLOCKING( fastest_cache_mutex );
@@ -263,7 +269,7 @@ static int d_get_suitable_dir_addr( struct sockaddr_in* dest_addr, char* ip_addr
 
     free( cache_relay );
   }
-  else if ( d_get_cache_relay_count() != 0 )
+  else if ( !g_dir_prefer_authority && d_get_cache_relay_count() != 0 )
   {
     cache_relay = px_get_cache_relay_by_identity( previous_fastest_identity, false );
     ret = 2;
@@ -626,6 +632,37 @@ finish:
   return ret;
 }
 
+// Robust wrapper around d_start_descriptor_fetch.  d_get_suitable_dir_addr pins
+// the "fastest" cache relay once it has enough samples; if that relay goes down
+// mid-bootstrap, a bare `while ( d_start_descriptor_fetch() < 0 )` spins forever
+// on the dead relay (no backoff, no fallback) and the whole bootstrap stalls
+// (seen as endless "couldn't connect to http server <ip>").  Back off between
+// attempts, and after a few failures drop the fastest pin so the next attempt
+// re-picks a RANDOM cache relay and escapes the dead one.
+static void v_start_descriptor_fetch_retry( FetchDescriptorState* fetch_state )
+{
+  int retry = 0;
+
+  while ( d_start_descriptor_fetch( fetch_state ) < 0 )
+  {
+    retry++;
+
+    MINITOR_LOG( MINITOR_TAG, "Failed to start fetch of relay descriptors, retry %d", retry );
+
+    // after a few failures the chosen cache relay is likely down: drop the
+    // fastest pin AND fall through to the directory authorities (reachable,
+    // they served the consensus) so we escape a dead relay instead of spinning.
+    if ( retry >= 3 )
+    {
+      fetch_speed_sample = 0;
+      g_dir_prefer_authority = 1;
+    }
+
+    // back off so we don't spin the CPU / flood the log while a relay is down
+    usleep( 300000 );
+  }
+}
+
 void v_handle_relay_fetch( void* pv_parameters )
 {
   int i;
@@ -641,6 +678,10 @@ void v_handle_relay_fetch( void* pv_parameters )
   int relays_fetched = 0;
 
   memset( fetch_states, 0, sizeof( fetch_states ) );
+
+  // start each cycle preferring (faster) cache relays; the retry helper flips
+  // this to the authorities only if cache relays start failing this cycle.
+  g_dir_prefer_authority = 0;
 
   for ( i = 0; i < 2; i++ )
   {
@@ -671,10 +712,7 @@ void v_handle_relay_fetch( void* pv_parameters )
         {
           if ( fetch_states[i].num_relays > 0 && fetch_states[i].num_relays < 3 )
           {
-            while ( d_start_descriptor_fetch( &fetch_states[i] ) < 0 )
-            {
-              MINITOR_LOG( MINITOR_TAG, "Failed to start fetch of relay descriptors, retrying: %d", fetch_states[i].num_relays );
-            }
+            v_start_descriptor_fetch_retry( &fetch_states[i] );
 
             fetch_poll[i].fd = fetch_states[i].sock_fd;
             fetch_poll[i].events = POLLIN;
@@ -694,10 +732,7 @@ void v_handle_relay_fetch( void* pv_parameters )
 
             if ( fetch_states[i].num_relays == 3 )
             {
-              while ( d_start_descriptor_fetch( &fetch_states[i] ) < 0 )
-              {
-                MINITOR_LOG( MINITOR_TAG, "Failed to start fetch of relay descriptors, retrying: %d", fetch_states[i].num_relays );
-              }
+              v_start_descriptor_fetch_retry( &fetch_states[i] );
 
               fetch_poll[i].fd = fetch_states[i].sock_fd;
               fetch_poll[i].events = POLLIN;
@@ -739,10 +774,7 @@ void v_handle_relay_fetch( void* pv_parameters )
             {
               MINITOR_LOG( MINITOR_TAG, "Failed to finish fetch of relay descriptors, retrying: %d", fetch_states[i].num_relays );
 
-              while ( d_start_descriptor_fetch( &fetch_states[i] ) < 0 )
-              {
-                MINITOR_LOG( MINITOR_TAG, "Failed to start fetch of relay descriptors, retrying: %d", fetch_states[i].num_relays );
-              }
+              v_start_descriptor_fetch_retry( &fetch_states[i] );
 
               fetch_poll[i].fd = fetch_states[i].sock_fd;
               fetch_poll[i].events = POLLIN;
