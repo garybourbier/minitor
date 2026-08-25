@@ -17,6 +17,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 */
 
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "../../include/config.h"
 #include "../../h/structures/consensus.h"
@@ -98,11 +100,17 @@ OnionRelay* px_get_relay_by_index( DoublyLinkedOnionRelayList* list, int index )
 {
   int i;
   DoublyLinkedOnionRelay* dl_relay;
+  OnionRelay* copy;
 
   dl_relay = list->head;
 
   for ( i = 0; i < index; i++ )
   {
+    if ( dl_relay == NULL )
+    {
+      return NULL;
+    }
+
     dl_relay = dl_relay->next;
   }
 
@@ -111,5 +119,13 @@ OnionRelay* px_get_relay_by_index( DoublyLinkedOnionRelayList* list, int index )
     return NULL;
   }
 
-  return dl_relay->relay;
+  // Return a COPY, not the list's own pointer.  Every caller hands the result to
+  // circuit building, which stores it in the circuit's relay_list and frees it
+  // on teardown.  Returning the shared pointer meant a circuit freed a relay
+  // still owned by service->target_relays -> double-free / heap corruption in
+  // d_router_truncate during the multi-HSDir publish (CORRUPT HEAP / reboot).
+  copy = malloc( sizeof( OnionRelay ) );
+  memcpy( copy, dl_relay->relay, sizeof( OnionRelay ) );
+
+  return copy;
 }
