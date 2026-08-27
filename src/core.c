@@ -57,6 +57,10 @@ static int handshake_fail_streak = 0;
 // with no successful CREATED2 in between, tear down that guard connection so the
 // next circuit picks a fresh guard.  The streak resets on any good CREATED2, so
 // a merely slow guard never trips it.
+// Re-enabled: a real silent guard death leaves every intro dead and the service
+// unreachable with no recovery, so we DO need the auto-drop.  The false-positive
+// churn is mitigated by resetting the streak on ANY cell from the guard (see
+// v_handle_tor_cell), so this only fires when the guard passes nothing at all.
 #define GUARD_DEAD_TIMEOUT_PASSES 3
 static int      guard_create_timeout_streak = 0;
 
@@ -1388,6 +1392,13 @@ static void v_handle_scheduled_consensus()
 // needs_republish flag, republishes the descriptor with the fresh intro set.  We
 // rotate ONE at a time and only when the service has all 3 live, so the set never
 // drops below 2 intros and this never turns into the old brute-force storm.
+// Rotate one intro every 2 keepalives (~4 min) so each of the 3 intros is
+// refreshed every ~12 min.  The RELAY_DROP keepalive below now keeps the full
+// multi-hop intro circuit alive, so we no longer need an aggressive one-per-tick
+// rotation to evacuate silently-dead intros — and rotating too fast republishes
+// the descriptor so often that it destabilises (clients keep fetching a churning
+// descriptor and get HOST UNREACHABLE).  We rotate ONE at a time and only when
+// all 3 intros are live, so the set never drops below 2.
 #define ROTATE_INTRO_EVERY_N_KEEPALIVES 2
 
 static void v_keep_circuitlist_alive()
@@ -1397,6 +1408,7 @@ static void v_keep_circuitlist_alive()
 
   int i;
   Cell* padding_cell;
+  Cell* drop_cell;
   DlConnection* or_connection;
   OnionCircuit* working_circuit;
   OnionCircuit* dead_circuits[20];
@@ -1471,17 +1483,46 @@ static void v_keep_circuitlist_alive()
         dead_count++;
       }
     }
-    // Padding succeeded, so this circuit looks alive from our side — but that
-    // means nothing for a silently dead intro.  On a rotation tick pick exactly
-    // one live intro (only when the service has its full 3, so we never drop
-    // below 2) and rebuild it below.  Guaranteed distinct from dead_circuits: a
-    // circuit is here only because its padding write did NOT fail.
-    else if ( do_rotate && rotate_intro == NULL
-              && working_circuit->status == CIRCUIT_INTRO_LIVE
-              && working_circuit->service != NULL
-              && working_circuit->service->intro_live_count == 3 )
+    else
     {
-      rotate_intro = working_circuit;
+      // Padding succeeded — but the PADDING cell above is LINK-level: it only
+      // keeps the board<->guard hop (hop 1) alive.  The middle->intro hops go
+      // idle and the relay closes the circuit without any DESTROY reaching us,
+      // so the intro silently dies: we still think it's live (padding keeps
+      // succeeding on the guard link) while the intro point can no longer
+      // deliver INTRODUCE2 back to us -> clients get INTRODUCE_ACK but the
+      // service never receives the introduction (HOST UNREACHABLE).  Fix: send a
+      // circuit-level RELAY_DROP to the far hop on each live intro so the WHOLE
+      // multi-hop circuit stays active.
+      if ( working_circuit->status == CIRCUIT_INTRO_LIVE )
+      {
+        drop_cell = malloc( MINITOR_CELL_LEN );
+
+        drop_cell->length = FIXED_CELL_HEADER_SIZE + RELAY_CELL_HEADER_SIZE;
+        drop_cell->command = RELAY;
+        drop_cell->circ_id = working_circuit->circ_id;
+
+        drop_cell->payload.relay.relay_command = RELAY_DROP;
+        drop_cell->payload.relay.recognized = 0;
+        drop_cell->payload.relay.stream_id = 0;
+        drop_cell->payload.relay.digest = 0;
+        drop_cell->payload.relay.length = 0;
+
+        if ( d_send_relay_cell_and_free( or_connection, drop_cell, &working_circuit->relay_list, NULL ) < 0 )
+        {
+          MINITOR_LOG( CORE_TAG, "Failed to send RELAY_DROP keepalive on circ_id: %x", working_circuit->circ_id );
+        }
+      }
+
+      // On a rotation tick pick exactly one live intro (only when the service
+      // has its full 3, so we never drop below 2) and rebuild it below.
+      if ( do_rotate && rotate_intro == NULL
+           && working_circuit->status == CIRCUIT_INTRO_LIVE
+           && working_circuit->service != NULL
+           && working_circuit->service->intro_live_count == 3 )
+      {
+        rotate_intro = working_circuit;
+      }
     }
 
     MINITOR_MUTEX_GIVE( connection_access_mutex[or_connection->mutex_index] );
